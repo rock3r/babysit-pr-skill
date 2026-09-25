@@ -59,6 +59,11 @@ DEFAULT_CONFIG = {
         # When true, the agent must ask the owner before deleting a merged branch.
         "branch_delete_requires_approval": False,
     },
+    "sync": {
+        # Paths or globs in the vendored skill folder that belong to the repository.
+        # sync.py never deletes or overwrites them. The watcher itself does not use this.
+        "keep": [],
+    },
 }
 
 
@@ -125,6 +130,9 @@ CONFIG_VALIDATORS = {
     },
     "cleanup": {
         "branch_delete_requires_approval": _check_bool,
+    },
+    "sync": {
+        "keep": _check_string_list,
     },
 }
 

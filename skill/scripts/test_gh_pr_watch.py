@@ -40,6 +40,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["review_bot_login_keywords"], ["codex"])
         self.assertEqual(config["max_session_minutes"], 90)
         self.assertEqual(config["require_up_to_date"], "auto")
+        self.assertEqual(config["sync"]["keep"], [])
         self.assertTrue(config["codex"]["enabled"])
         self.assertFalse(config["codex"]["required"])
         self.assertNotIn("coderabbit", config)
@@ -95,11 +96,17 @@ class ConfigTests(unittest.TestCase):
             {"version": "1"},
             {"require_up_to_date": "yes"},
             {"require_up_to_date": 1},
+            {"sync": {"keep": "skill-source.json"}},
         ]
         for raw in bad_values:
             with self.subTest(raw=raw):
                 with self.assertRaises(watch.ConfigError):
                     watch.build_config(raw)
+
+    def test_sync_keep_list_is_a_known_key(self):
+        config, warnings = watch.build_config({"sync": {"keep": ["skill-source.json", "extras/*.yaml"]}})
+        self.assertEqual(warnings, [])
+        self.assertEqual(config["sync"]["keep"], ["skill-source.json", "extras/*.yaml"])
 
     def test_top_level_must_be_an_object(self):
         with self.assertRaises(watch.ConfigError):

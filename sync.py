@@ -6,11 +6,14 @@ Usage:
 
 The script copies `skill/` at the given Git ref of this repository into
 `<target-repo>/.agents/skills/babysit-pr/`. It deletes vendored files that are no
-longer part of the skill, never touches `config.json`, and records the version in
-`VERSION`. Without --ref it uses the newest `v*` tag.
+longer part of the skill, never touches `config.json`, `skill-source.json`, or the paths
+listed under `sync.keep` in `config.json`, and records the version in `VERSION`.
+Without --ref it uses the newest `v*` tag.
 """
 
 import argparse
+import fnmatch
+import json
 import os
 import subprocess
 import sys
@@ -22,8 +25,10 @@ TARGET_SUBDIR = Path(".agents") / "skills" / "babysit-pr"
 CONFIG_NAME = "config.json"
 EXAMPLE_CONFIG_NAME = "config.example.json"
 VERSION_NAME = "VERSION"
+SIDECAR_NAME = "skill-source.json"
 # Files at the root of the vendored folder that belong to the consumer, not the skill.
-RESERVED_NAMES = {CONFIG_NAME, VERSION_NAME}
+# `skill-source.json` is a sidecar that several repositories keep next to their skills.
+RESERVED_NAMES = {CONFIG_NAME, VERSION_NAME, SIDECAR_NAME}
 # Build output that Python writes next to the scripts. It is never part of the skill.
 IGNORED_DIR_NAMES = {"__pycache__"}
 
@@ -96,6 +101,27 @@ def read_skill_files(source_repo, commit):
     return files
 
 
+def read_keep_patterns(skill_dir):
+    """The `sync.keep` globs from the consumer's config.json, relative to the skill folder."""
+    config_path = skill_dir / CONFIG_NAME
+    if not config_path.exists():
+        return []
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        raise SyncError(f"cannot read {config_path}: {err}") from err
+    section = config.get("sync", {}) if isinstance(config, dict) else {}
+    keep = section.get("keep", []) if isinstance(section, dict) else None
+    if not isinstance(keep, list) or not all(isinstance(item, str) and item.strip() for item in keep):
+        raise SyncError(f"sync.keep in {config_path} must be a list of non-empty strings")
+    return keep
+
+
+def is_kept(rel_path, patterns):
+    """Whether a path belongs to the consumer. `*` in a pattern also matches `/`."""
+    return rel_path in RESERVED_NAMES or any(fnmatch.fnmatchcase(rel_path, pattern) for pattern in patterns)
+
+
 def existing_vendored_files(skill_dir):
     """Relative paths of files in the vendored folder that the skill owns."""
     found = []
@@ -104,10 +130,7 @@ def existing_vendored_files(skill_dir):
     for dir_path, dir_names, file_names in os.walk(skill_dir):
         dir_names[:] = [name for name in dir_names if name not in IGNORED_DIR_NAMES]
         for name in file_names:
-            rel_path = (Path(dir_path) / name).relative_to(skill_dir).as_posix()
-            if rel_path in RESERVED_NAMES:
-                continue
-            found.append(rel_path)
+            found.append((Path(dir_path) / name).relative_to(skill_dir).as_posix())
     return sorted(found)
 
 
@@ -137,6 +160,7 @@ def sync(source_repo, target_repo, ref=None, dry_run=False):
     commit, tag = resolve_ref(source_repo, ref)
     files = read_skill_files(source_repo, commit)
     skill_dir = target_repo / TARGET_SUBDIR
+    keep_patterns = read_keep_patterns(skill_dir)
 
     report = {
         "ref": ref,
@@ -147,18 +171,26 @@ def sync(source_repo, target_repo, ref=None, dry_run=False):
         "updated": [],
         "removed": [],
         "unchanged": [],
+        "kept": [],
         "config_created": False,
         "dry_run": dry_run,
     }
 
     for rel_path in existing_vendored_files(skill_dir):
-        if rel_path not in files:
+        if rel_path in (CONFIG_NAME, VERSION_NAME):
+            continue
+        if is_kept(rel_path, keep_patterns):
+            report["kept"].append(rel_path)
+        elif rel_path not in files:
             report["removed"].append(rel_path)
             if not dry_run:
                 (skill_dir / rel_path).unlink()
 
     for rel_path, (content, executable) in sorted(files.items()):
         path = skill_dir / rel_path
+        if is_kept(rel_path, keep_patterns):
+            # The repository owns this path, so the skill's copy never replaces it.
+            continue
         if not path.exists():
             report["added"].append(rel_path)
         elif path.read_bytes() != content or is_executable(path) != executable:
@@ -187,7 +219,7 @@ def print_report(report):
     label = report["tag"] or "untagged commit"
     prefix = "Would sync" if report["dry_run"] else "Synced"
     print(f"{prefix} babysit-pr {label} ({report['commit'][:12]}) into {report['target']}")
-    for key in ("added", "updated", "removed"):
+    for key in ("added", "updated", "removed", "kept"):
         for rel_path in report[key]:
             print(f"  {key:<8} {rel_path}")
     if report["config_created"]:

@@ -1,4 +1,5 @@
 import io
+import json
 import stat
 import subprocess
 import sys
@@ -101,20 +102,20 @@ class SyncTests(unittest.TestCase):
 
     def test_upgrade_removes_files_that_left_the_skill_and_reports_changes(self):
         self.run_sync("v1.0.0")
-        (self.skill / "skill-source.json").write_text("{}\n")
+        (self.skill / "notes.txt").write_text("stray\n")
         (self.skill / "agents").mkdir()
         (self.skill / "agents" / "stale.yaml").write_text("x\n")
 
         report = self.run_sync("v1.1.0")
 
         self.assertFalse((self.skill / "references" / "old.md").exists())
-        self.assertFalse((self.skill / "skill-source.json").exists())
+        self.assertFalse((self.skill / "notes.txt").exists())
         self.assertFalse((self.skill / "agents").exists())
         self.assertEqual((self.skill / "references" / "new.md").read_text(), "new\n")
         self.assertEqual(report["added"], ["references/new.md"])
         self.assertEqual(report["updated"], ["SKILL.md"])
         self.assertEqual(
-            sorted(report["removed"]), ["agents/stale.yaml", "references/old.md", "skill-source.json"])
+            sorted(report["removed"]), ["agents/stale.yaml", "notes.txt", "references/old.md"])
         self.assertIn("tag: v1.1.0", (self.skill / "VERSION").read_text())
 
     def test_downgrade_to_an_older_tag_works(self):
@@ -180,6 +181,79 @@ class SyncTests(unittest.TestCase):
 
         self.assertEqual((self.skill / "config.json").read_text(), '{"version": 1}\n')
         self.assertIn("tag: v2.0.0", (self.skill / "VERSION").read_text())
+
+    def _write_consumer(self, rel_path, content):
+        path = self.skill / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        return path
+
+    def _keep(self, *patterns):
+        self._write_consumer("config.json", json.dumps({"sync": {"keep": list(patterns)}}))
+
+    def test_skill_source_json_is_kept_without_any_config(self):
+        self.run_sync("v1.0.0")
+        sidecar = self._write_consumer("skill-source.json", '{"owner": "consumer"}\n')
+
+        report = self.run_sync("v1.1.0")
+
+        self.assertEqual(sidecar.read_text(), '{"owner": "consumer"}\n')
+        self.assertNotIn("skill-source.json", report["removed"])
+        self.assertIn("skill-source.json", report["kept"])
+
+    def test_a_path_from_the_keep_list_survives(self):
+        self.run_sync("v1.0.0")
+        self._keep("local-notes.md")
+        notes = self._write_consumer("local-notes.md", "ours\n")
+
+        report = self.run_sync("v1.1.0")
+
+        self.assertEqual(notes.read_text(), "ours\n")
+        self.assertEqual(report["kept"], ["local-notes.md"])
+
+    def test_a_glob_from_the_keep_list_survives_and_other_strays_go(self):
+        self.run_sync("v1.0.0")
+        self._keep("extras/*.yaml")
+        self._write_consumer("extras/a.yaml", "a\n")
+        self._write_consumer("extras/nested/b.yaml", "b\n")
+        self._write_consumer("extras/c.txt", "c\n")
+        self._write_consumer("stray.md", "stray\n")
+
+        report = self.run_sync("v1.1.0")
+
+        self.assertTrue((self.skill / "extras" / "a.yaml").exists())
+        self.assertTrue((self.skill / "extras" / "nested" / "b.yaml").exists())
+        self.assertFalse((self.skill / "extras" / "c.txt").exists())
+        self.assertFalse((self.skill / "stray.md").exists())
+        self.assertEqual(sorted(report["removed"]), ["extras/c.txt", "references/old.md", "stray.md"])
+        self.assertEqual(report["kept"], ["extras/a.yaml", "extras/nested/b.yaml"])
+
+    def test_a_kept_path_is_never_overwritten_by_the_skill(self):
+        self.run_sync("v1.0.0")
+        self._keep("references/new.md")
+        local = self._write_consumer("references/new.md", "our version\n")
+
+        report = self.run_sync("v1.1.0")
+
+        self.assertEqual(local.read_text(), "our version\n")
+        self.assertNotIn("references/new.md", report["added"] + report["updated"])
+        self.assertIn("references/new.md", report["kept"])
+
+    def test_a_bad_keep_list_stops_before_any_change(self):
+        self.run_sync("v1.0.0")
+        self._write_consumer("config.json", json.dumps({"sync": {"keep": "skill-source.json"}}))
+
+        with self.assertRaises(sync.SyncError):
+            self.run_sync("v1.1.0")
+        self.assertTrue((self.skill / "references" / "old.md").exists())
+
+    def test_an_unreadable_config_stops_before_any_change(self):
+        self.run_sync("v1.0.0")
+        self._write_consumer("config.json", "{ not json")
+
+        with self.assertRaises(sync.SyncError):
+            self.run_sync("v1.1.0")
+        self.assertTrue((self.skill / "references" / "old.md").exists())
 
     def test_python_caches_are_left_alone(self):
         self.run_sync("v1.0.0")
