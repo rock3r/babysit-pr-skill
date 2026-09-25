@@ -1646,9 +1646,137 @@ class CodexGateReactionTests(unittest.TestCase):
         self.assertEqual(gate["status"], "idle")
 
     def test_unknown_when_reactions_unavailable(self):
+        # A failed lookup cannot prove that Codex removed its 👀 reaction, so the gate
+        # stays closed and the watcher keeps waiting until the lookup works again.
         gate = watch.summarize_codex_gate(None)
-        self.assertFalse(gate["reviewing"])
+        self.assertTrue(gate["reviewing"])
         self.assertEqual(gate["status"], "unknown")
+
+    def test_unknown_gate_emits_wait_codex_instead_of_idle(self):
+        pr = {"closed": False, "merged": False, "mergeable": "MERGEABLE",
+              "merge_state_status": "CLEAN", "review_decision": ""}
+        checks = {"all_terminal": True, "failed_count": 0, "pending_count": 0,
+                  "passed_count": 1, "skipping_count": 0}
+        actions = watch.recommend_actions(
+            pr, checks, failed_runs=[], new_review_items=[], hung_checks=[],
+            retries_used=0, max_retries=3, checks_terminal_elapsed=120,
+            blocking_review_items=[], codex_gate=watch.summarize_codex_gate(None),
+        )
+        self.assertEqual(actions, ["wait_codex"])
+
+    def test_codex_identity_is_exact(self):
+        self.assertTrue(watch.is_codex_bot_login("chatgpt-codex-connector[bot]"))
+        self.assertTrue(watch.is_codex_bot_login("chatgpt-codex-connector"))
+        self.assertFalse(watch.is_codex_bot_login("fake-chatgpt-codex-connector"))
+        self.assertFalse(watch.is_codex_bot_login("codex-fan"))
+
+    def test_eyes_reaction_from_a_lookalike_login_is_ignored(self):
+        reactions = [{"content": "eyes", "user": {"login": "codex-fan"}}]
+        self.assertFalse(watch.summarize_codex_gate(reactions)["reviewing"])
+
+
+class GhCommandHardeningTests(unittest.TestCase):
+    @staticmethod
+    def _fake_gh_run(returncode, stdout, stderr=""):
+        def run(cmd, check=False, **_kwargs):
+            if check and returncode != 0:
+                raise watch.subprocess.CalledProcessError(returncode, cmd, output=stdout, stderr=stderr)
+            return watch.subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
+
+        return run
+
+    def _run_emitting(self, payload):
+        """Run gh_text against a real child process that writes `payload` as UTF-8."""
+        emitter = "import sys; sys.stdout.buffer.write({}.encode('utf-8'))".format(ascii(payload))
+        real_run = watch.subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            return real_run([sys.executable, "-c", emitter], **kwargs)
+
+        return patch.object(watch.subprocess, "run", side_effect=fake_run)
+
+    def test_gh_text_requests_utf8_decoding_and_a_timeout(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(stdout="{}", stderr="")
+
+        with patch.object(watch.subprocess, "run", side_effect=fake_run):
+            watch.gh_text(["pr", "view"])
+
+        self.assertEqual(captured.get("encoding"), "utf-8")
+        self.assertEqual(captured.get("errors"), "replace")
+        self.assertEqual(captured.get("timeout"), watch.GH_COMMAND_TIMEOUT_SECONDS)
+
+    def test_gh_text_decodes_non_ascii_output(self):
+        # An em dash or emoji in a review body must not fail on a non-UTF-8 locale.
+        body = "Codex review — nit \U0001f41b"
+        with self._run_emitting(body):
+            self.assertEqual(watch.gh_text(["pr", "view"]), body)
+
+    def test_gh_json_parses_non_ascii_output(self):
+        body = "Review — found an issue \U0001f41b"
+        with self._run_emitting(json.dumps({"body": body}, ensure_ascii=False)):
+            self.assertEqual(watch.gh_json(["pr", "view", "--json", "body"])["body"], body)
+
+    def test_gh_text_raises_when_stdout_is_missing(self):
+        # A dead stdout reader thread must not leak out as an AttributeError on None.
+        with patch.object(watch.subprocess, "run", return_value=SimpleNamespace(stdout=None, stderr="")):
+            with self.assertRaises(watch.GhCommandError) as context:
+                watch.gh_json(["pr", "view", "--json", "number"])
+        self.assertIn("No output captured", str(context.exception))
+
+    def test_gh_text_times_out(self):
+        timeout = watch.subprocess.TimeoutExpired(["gh", "pr", "view"], watch.GH_COMMAND_TIMEOUT_SECONDS)
+        with patch.object(watch.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(watch.GhCommandError) as context:
+                watch.gh_text(["pr", "view"])
+        self.assertIn("timed out", str(context.exception))
+
+    def test_other_exit_codes_still_fail_even_with_output(self):
+        fake = self._fake_gh_run(4, '{"message": "authentication required"}')
+        with patch.object(watch.subprocess, "run", side_effect=fake):
+            with self.assertRaises(watch.GhCommandError):
+                watch.get_pr_checks("21", repo="owner/repo")
+
+    def test_load_state_reads_non_ascii_state_files_as_utf8(self):
+        # Check names with emoji reach the state file through pending_check_key().
+        key = "build \U0001f680|CI — main|https://example.test/1"
+        state = {"last_snapshot_at": watch.time.time(), "pending_checks_first_seen_at": {key: 1}}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = watch.Path(tmp_dir) / "state.json"
+            path.write_bytes(json.dumps(state, ensure_ascii=False).encode("utf-8"))
+            loaded, _ = watch.load_state(path)
+        self.assertEqual(loaded["pending_checks_first_seen_at"], {key: 1})
+
+
+class ReviewThreadLookupTests(unittest.TestCase):
+    def test_rejects_graphql_errors_instead_of_returning_no_blockers(self):
+        with patch.object(watch, "gh_json", return_value={"data": None, "errors": [{"message": "boom"}]}):
+            with self.assertRaises(watch.GhCommandError):
+                watch.get_unresolved_review_comment_ids("owner/repo", 1)
+
+    def test_rejects_a_payload_without_review_threads(self):
+        with patch.object(watch, "gh_json", return_value={"data": {"repository": {"pullRequest": None}}}):
+            with self.assertRaises(watch.GhCommandError):
+                watch.get_unresolved_review_comment_ids("owner/repo", 1)
+
+    def test_own_resolved_threads_do_not_block(self):
+        pr = {"repo": "owner/repo", "number": 27, "head_sha": "abc123"}
+        state = {"seen_issue_comment_ids": [], "seen_review_comment_ids": [], "seen_review_ids": [],
+                 "last_review_poll_at": None}
+        own = {"id": 8, "user": {"login": "octocat"}, "author_association": "OWNER",
+               "created_at": "2025-01-01T00:00:00Z", "body": "Rename this.", "path": "a.py",
+               "line": 1, "commit_id": "abc123", "html_url": "https://example.invalid/c"}
+        with patch.object(watch, "gh_api_list_paginated", side_effect=[[], [own], []]), \
+                patch.object(watch, "get_unresolved_review_comment_ids",
+                             return_value={"ids": set(), "truncated": False}):
+            new_items, blocking_items = watch.fetch_new_review_items(
+                pr, state, fresh_state=True, authenticated_login="octocat")
+
+        self.assertEqual(new_items, [])
+        self.assertEqual(blocking_items, [])
 
 
 if __name__ == "__main__":

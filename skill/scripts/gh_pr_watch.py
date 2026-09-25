@@ -243,13 +243,17 @@ CHECKS_TERMINAL_GRACE_PERIOD_SECONDS = 60
 STATUS_ONLY_BOT_COMMENT_MARKER = "<!-- codex-pull-request-review-summary -->"
 
 GH_PR_CHECKS_STATE_EXIT_CODES = (0, 1, 8)
+# A hung `gh` call (network trouble, an auth prompt) must not freeze the watcher.
+GH_COMMAND_TIMEOUT_SECONDS = 60
 
-# Login keyword fragments for Codex bot, used for emoji reaction gate detection.
+# The exact Codex bot identity, used for the 👀 reaction gate and the review summary.
 # Codex signals it is reviewing a PR by adding a 👀 reaction; it either posts a
 # review with comments (issues found) or removes the reaction silently (clean).
-CODEX_BOT_LOGIN_KEYWORDS = {
-    "codex",
-    "chatgpt-codex",
+# The REST API reports the login with a `[bot]` suffix, GraphQL without it. A loose
+# substring match would let any account with "codex" in its name hold or open the gate.
+CODEX_BOT_LOGINS = {
+    "chatgpt-codex-connector[bot]",
+    "chatgpt-codex-connector",
 }
 
 STATE_STALENESS_RESET_SECONDS = 2 * 60 * 60
@@ -357,13 +361,29 @@ def gh_text(args, repo=None, ok_exit_codes=(0,)):
         cmd.extend(["-R", repo])
     cmd.extend(args)
     try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            # GitHub output is UTF-8. Without an explicit encoding Python decodes with the
+            # locale default (cp1252 on Windows), which fails on emoji in review comments.
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_COMMAND_TIMEOUT_SECONDS,
+        )
     except FileNotFoundError as err:
         raise GhCommandError("`gh` command not found") from err
+    except subprocess.TimeoutExpired as err:
+        raise GhCommandError(f"GitHub CLI command timed out: {' '.join(cmd)}") from err
     except subprocess.CalledProcessError as err:
         if err.returncode in ok_exit_codes and (err.stdout or "").strip():
             return err.stdout
         raise GhCommandError(_format_gh_error(cmd, err)) from err
+    if proc.stdout is None:
+        # `subprocess` leaves stdout as None when its reader thread dies, which would
+        # otherwise surface later as a confusing AttributeError.
+        raise GhCommandError(f"No output captured from GitHub CLI command: {' '.join(cmd)}")
     return proc.stdout
 
 
@@ -492,7 +512,7 @@ def is_state_stale(state, now_seconds=None):
 def load_state(path):
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as err:
             raise RuntimeError(f"State file is not valid JSON: {path}") from err
         if not isinstance(data, dict):
@@ -686,8 +706,7 @@ def failed_runs_from_workflow_runs(runs, head_sha):
 
 
 def is_codex_bot_login(login):
-    lower = str(login or "").lower()
-    return any(keyword in lower for keyword in CODEX_BOT_LOGIN_KEYWORDS)
+    return str(login or "").lower() in CODEX_BOT_LOGINS
 
 
 def get_pr_issue_reactions(repo, pr_number):
@@ -733,7 +752,9 @@ def summarize_codex_gate(reactions):
     lookup failed).
     """
     if reactions is None:
-        return {"reviewing": False, "status": "unknown"}
+        # A failed reactions lookup cannot prove that Codex removed its 👀 reaction.
+        # Keep the gate closed and let the next poll retry the lookup.
+        return {"reviewing": True, "status": "unknown"}
     if _bot_has_eyes_reaction(reactions, is_codex_bot_login):
         return {"reviewing": True, "status": "in_progress"}
     return {"reviewing": False, "status": "idle"}
@@ -846,11 +867,21 @@ def get_unresolved_review_comment_ids(repo, pr_number):
         if not isinstance(payload, dict):
             raise GhCommandError("Unexpected GraphQL payload for review threads")
 
-        data = payload.get("data") or {}
-        repository = data.get("repository") or {}
-        pull_request = repository.get("pullRequest") or {}
-        review_threads = pull_request.get("reviewThreads") or {}
-        nodes = review_threads.get("nodes") or []
+        # A GraphQL error comes back with exit code 0 and no data. Reading it as "no
+        # unresolved threads" would let the watcher report a blocked PR as ready.
+        data = payload.get("data")
+        if payload.get("errors") or not isinstance(data, dict):
+            raise GhCommandError("GraphQL review-thread lookup returned errors or no data")
+        repository = data.get("repository")
+        if not isinstance(repository, dict):
+            raise GhCommandError("Unexpected GraphQL repository payload for review threads")
+        pull_request = repository.get("pullRequest")
+        if not isinstance(pull_request, dict):
+            raise GhCommandError("Unexpected GraphQL pull-request payload for review threads")
+        review_threads = pull_request.get("reviewThreads")
+        if not isinstance(review_threads, dict):
+            raise GhCommandError("Unexpected GraphQL reviewThreads payload")
+        nodes = review_threads.get("nodes")
 
         if not isinstance(nodes, list):
             raise GhCommandError("Unexpected reviewThreads.nodes payload")
