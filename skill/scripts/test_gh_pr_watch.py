@@ -1672,6 +1672,117 @@ class ReviewListFallbackTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in new_items], ["5"])
 
 
+class CodeRabbitGateTests(unittest.TestCase):
+    """CodeRabbit gates a PR only while it shows signs of life on it."""
+
+    def test_gate_inert_when_no_coderabbit_activity(self):
+        gate = watch.summarize_coderabbit_gate([], [])
+        self.assertFalse(gate["active"])
+        self.assertFalse(gate["reviewing"])
+        self.assertEqual(gate["status"], "idle")
+
+    def test_gate_ignores_other_bots_reactions(self):
+        reactions = [{"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}}]
+        gate = watch.summarize_coderabbit_gate([], reactions)
+        self.assertFalse(gate["active"])
+        self.assertFalse(gate["reviewing"])
+
+    def test_gate_reviewing_when_check_pending(self):
+        gate = watch.summarize_coderabbit_gate([{"name": "CodeRabbit", "bucket": "pending", "state": "QUEUED"}], [])
+        self.assertTrue(gate["active"])
+        self.assertTrue(gate["present_check"])
+        self.assertTrue(gate["reviewing"])
+        self.assertEqual(gate["status"], "in_progress")
+
+    def test_gate_reviewing_when_pending_rerun_follows_old_completed_check(self):
+        checks = [
+            {"name": "CodeRabbit", "bucket": "pass", "state": "SUCCESS", "startedAt": "0001-01-01T00:00:00Z"},
+            {"name": "CodeRabbit", "bucket": "pending", "state": "QUEUED", "startedAt": "0001-01-01T00:00:00Z"},
+        ]
+        gate = watch.summarize_coderabbit_gate(checks, [])
+        self.assertTrue(gate["reviewing"])
+        self.assertEqual(gate["status"], "in_progress")
+
+    def test_gate_active_not_reviewing_when_check_success(self):
+        gate = watch.summarize_coderabbit_gate([{"name": "CodeRabbit", "bucket": "pass", "state": "SUCCESS"}], [])
+        self.assertTrue(gate["active"])
+        self.assertFalse(gate["reviewing"])
+        self.assertEqual(gate["status"], "active")
+
+    def test_gate_blocks_when_reactions_are_unknown_after_check_completion(self):
+        gate = watch.summarize_coderabbit_gate([{"name": "CodeRabbit", "bucket": "pass", "state": "SUCCESS"}], None)
+        self.assertTrue(gate["reviewing"])
+        self.assertEqual(gate["status"], "unknown")
+
+    def test_gate_reviewing_when_coderabbit_eyes_reaction_without_check(self):
+        gate = watch.summarize_coderabbit_gate([], [{"content": "eyes", "user": {"login": "coderabbitai[bot]"}}])
+        self.assertTrue(gate["active"])
+        self.assertFalse(gate["present_check"])
+        self.assertTrue(gate["reviewing"])
+
+    def test_gate_active_not_reviewing_for_non_eyes_coderabbit_reaction(self):
+        gate = watch.summarize_coderabbit_gate([], [{"content": "+1", "user": {"login": "coderabbitai[bot]"}}])
+        self.assertTrue(gate["active"])
+        self.assertFalse(gate["reviewing"])
+        self.assertEqual(gate["status"], "active")
+
+    def test_reviewing_coderabbit_blocks_readiness_and_emits_wait_coderabbit(self):
+        gate = {"active": True, "reviewing": True, "status": "in_progress"}
+        actions = _actions_for(_open_pr(), coderabbit_gate=gate)
+        self.assertEqual(actions, ["wait_coderabbit"])
+        self.assertFalse(watch.needs_agent_attention(actions))
+        self.assertFalse(watch.needs_agent_attention(["diagnose_merge_conflict", "wait_coderabbit"]))
+
+    def test_dormant_coderabbit_allows_readiness(self):
+        gate = {"active": False, "reviewing": False, "status": "idle"}
+        self.assertEqual(_actions_for(_open_pr(), coderabbit_gate=gate), ["stop_ready_to_merge"])
+
+    def test_ci_is_not_green_while_coderabbit_reviews(self):
+        snapshot = {
+            "pr": {"review_decision": "APPROVED"},
+            "checks": _green_checks(),
+            "blocking_review_items": [],
+            "checks_terminal_elapsed_seconds": 120,
+            "coderabbit_gate": {"reviewing": True},
+        }
+        self.assertFalse(watch.is_ci_green(snapshot))
+
+    def test_coderabbit_comments_are_findings_only_when_enabled(self):
+        with configured():
+            self.assertFalse(watch.is_actionable_review_bot_login("coderabbitai[bot]"))
+        with configured({"coderabbit": {"enabled": True}}):
+            self.assertTrue(watch.is_actionable_review_bot_login("coderabbitai[bot]"))
+
+    def _snapshot(self, overrides):
+        pr = {
+            "repo": "owner/repo", "number": 21, "head_sha": "abc123",
+            "closed": False, "merged": False, "mergeable": "MERGEABLE",
+            "merge_state_status": "CLEAN", "review_decision": "",
+        }
+        args = SimpleNamespace(pr="21", repo=None, state_file=None, max_flaky_retries=3)
+        checks = [{"name": "CodeRabbit", "bucket": "pending", "state": "QUEUED"}]
+        with tempfile.TemporaryDirectory() as tmp, configured(overrides), \
+                patch.object(watch, "resolve_pr", return_value=pr), \
+                patch.object(watch, "default_state_file_for", return_value=watch.Path(tmp) / "s.json"), \
+                patch.object(watch, "get_pr_checks", return_value=checks), \
+                patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                patch.object(watch, "get_pr_issue_reactions", return_value=[]) as reactions_lookup, \
+                patch.object(watch, "gh_api_list_paginated", return_value=[]), \
+                patch.object(watch, "fetch_new_review_items", return_value=([], [])):
+            snapshot, _ = watch.collect_snapshot(args)
+        return snapshot, reactions_lookup
+
+    def test_snapshot_has_no_coderabbit_gate_when_disabled(self):
+        snapshot, _ = self._snapshot({})
+        self.assertIsNone(snapshot["coderabbit_gate"])
+
+    def test_snapshot_shares_one_reactions_lookup_between_gates(self):
+        snapshot, reactions_lookup = self._snapshot({"coderabbit": {"enabled": True}})
+        self.assertTrue(snapshot["coderabbit_gate"]["reviewing"])
+        self.assertIn("wait_coderabbit", snapshot["actions"])
+        reactions_lookup.assert_called_once()
+
+
 class SnapshotOrderingTests(unittest.TestCase):
     def test_codex_gate_is_read_before_review_comments(self):
         # If Codex posts a finding and then marks the head reviewed between the two reads,
@@ -1684,7 +1795,7 @@ class SnapshotOrderingTests(unittest.TestCase):
         }
         args = SimpleNamespace(pr="21", repo=None, state_file=None, max_flaky_retries=3)
 
-        def gate(_pr):
+        def gate(_pr, **_kwargs):
             calls.append("codex_gate")
             return {"reviewing": False, "status": "idle", "active": True, "head_reviewed": True}
 
@@ -1697,6 +1808,7 @@ class SnapshotOrderingTests(unittest.TestCase):
                 patch.object(watch, "default_state_file_for", return_value=watch.Path(tmp) / "s.json"), \
                 patch.object(watch, "get_pr_checks", return_value=[]), \
                 patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                patch.object(watch, "get_pr_issue_reactions", return_value=[]), \
                 patch.object(watch, "collect_codex_gate", side_effect=gate), \
                 patch.object(watch, "fetch_new_review_items", side_effect=reviews), \
                 patch.object(watch, "save_state", return_value=None):
