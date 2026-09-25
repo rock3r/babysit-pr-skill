@@ -1783,6 +1783,293 @@ class CodeRabbitGateTests(unittest.TestCase):
         reactions_lookup.assert_called_once()
 
 
+PR_AF_CONFIG = {
+    "pr_af": {
+        "enabled": True,
+        "label": "pr-af",
+        "workflow_names": ["PR-AF Review"],
+        "check_names": ["pr-af-review"],
+        "review_body_markers": ["pr-af review \u2014", "reviewed by [pr-af]"],
+        "missing_check_grace_minutes": 5,
+    }
+}
+
+
+def _pr_af_check(bucket="pass", state="SUCCESS", started="", completed="", link="https://example.invalid/pr-af"):
+    return {"name": "pr-af-review", "workflow": "PR-AF Review", "bucket": bucket, "state": state,
+            "startedAt": started, "completedAt": completed, "link": link}
+
+
+def _ci_pass():
+    return {"name": "CI", "workflow": "CI", "bucket": "pass", "state": "SUCCESS"}
+
+
+class PrAfCheckTests(unittest.TestCase):
+    """PR-AF runs as an advisory check: it can hold readiness while it runs, but its
+    own result never counts as a CI failure."""
+
+    def setUp(self):
+        patcher = configured(PR_AF_CONFIG)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_summarize_checks_ignores_pr_af_checks(self):
+        summary = watch.summarize_checks([_pr_af_check("fail", "FAILURE"), _ci_pass()])
+        self.assertEqual(summary["failed_count"], 0)
+        self.assertEqual(summary["passed_count"], 1)
+        self.assertTrue(summary["all_terminal"])
+
+    def test_failed_runs_ignore_the_pr_af_workflow(self):
+        runs = [
+            {"id": 123, "name": "PR-AF Review", "head_sha": "abc123", "status": "completed",
+             "conclusion": "failure", "html_url": "https://example.invalid/pr-af"},
+            {"id": 124, "name": "CI", "head_sha": "abc123", "status": "completed",
+             "conclusion": "failure", "html_url": "https://example.invalid/ci"},
+        ]
+        failed_runs = watch.failed_runs_from_workflow_runs(runs, "abc123")
+        self.assertEqual([run["workflow_name"] for run in failed_runs], ["CI"])
+
+    def test_name_matching_is_exact_after_normalising_case_and_spaces(self):
+        self.assertTrue(watch.is_pr_af_name("PR-AF Review"))
+        self.assertTrue(watch.is_pr_af_name("  pr-af   REVIEW "))
+        self.assertTrue(watch.is_pr_af_name("pr-af-review"))
+        self.assertFalse(watch.is_pr_af_name("verify-pr-after-rebase"))
+        self.assertFalse(watch.is_pr_af_name("PR-AF Review (nightly)"))
+
+    def test_hung_detection_ignores_pr_af_checks(self):
+        check = _pr_af_check("pending", "IN_PROGRESS")
+        with patch.object(watch.time, "time", return_value=watch.hung_threshold_for_check("x") + 101):
+            hung = watch.hung_checks_from_checks([check], {watch.pending_check_key(check): 100})
+        self.assertEqual(hung, [])
+
+    def test_running_pr_af_check_holds_readiness_with_wait_pr_af(self):
+        checks = [_pr_af_check("pending", "IN_PROGRESS"), _ci_pass()]
+        actions = _actions_for(_open_pr(), watch.summarize_checks(checks),
+                               pr_af_gate=watch.summarize_pr_af_gate_from_checks(checks))
+        self.assertEqual(actions, ["wait_pr_af"])
+        self.assertFalse(watch.needs_agent_attention(actions))
+
+    def test_failed_pr_af_check_does_not_block_readiness(self):
+        checks = [_pr_af_check("fail", "FAILURE"), _ci_pass()]
+        actions = _actions_for(_open_pr(), watch.summarize_checks(checks),
+                               pr_af_gate=watch.summarize_pr_af_gate_from_checks(checks))
+        self.assertIn("stop_ready_to_merge", actions)
+
+    def test_labelled_pr_waits_briefly_for_a_missing_pr_af_check(self):
+        gate = {"present": True, "status": "missing_wait", "conclusion": "", "is_success": False}
+        self.assertEqual(_actions_for(_open_pr(labels=["pr-af"]), pr_af_gate=gate), ["wait_pr_af"])
+
+    def test_labelled_pr_goes_on_after_the_missing_check_grace(self):
+        gate = {"present": True, "status": "missing_timeout", "conclusion": "", "is_success": False}
+        self.assertIn("stop_ready_to_merge", _actions_for(_open_pr(labels=["pr-af"]), pr_af_gate=gate))
+
+    def test_missing_check_grace_comes_from_config(self):
+        pr = _open_pr(labels=["pr-af"], head_sha="abc123")
+        missing = {"present": False, "status": "missing", "conclusion": "", "is_success": False}
+        state = {}
+        gate = watch.apply_pr_af_missing_check_grace(pr, missing, state, now_seconds=1000)
+        self.assertEqual(gate["status"], "missing_wait")
+        gate = watch.apply_pr_af_missing_check_grace(pr, missing, state, now_seconds=1000 + 5 * 60)
+        self.assertEqual(gate["status"], "missing_timeout")
+        with configured({"pr_af": dict(PR_AF_CONFIG["pr_af"], missing_check_grace_minutes=0)}):
+            gate = watch.apply_pr_af_missing_check_grace(pr, missing, {}, now_seconds=1000)
+        self.assertEqual(gate["status"], "missing_timeout")
+
+    def test_label_name_comes_from_config(self):
+        missing = {"present": False, "status": "missing", "conclusion": "", "is_success": False}
+        with configured({"pr_af": dict(PR_AF_CONFIG["pr_af"], label="deep-review")}):
+            pr = _open_pr(labels=["Deep-Review"], head_sha="abc123")
+            gate = watch.apply_pr_af_missing_check_grace(pr, missing, {}, now_seconds=1000)
+            self.assertEqual(gate["status"], "missing_wait")
+            unlabelled = watch.apply_pr_af_missing_check_grace(
+                _open_pr(labels=["pr-af"], head_sha="abc123"), missing, {}, now_seconds=1000)
+            self.assertEqual(unlabelled["status"], "missing")
+            events = [{"__typename": "LabeledEvent", "createdAt": "2026-08-24T08:10:00Z",
+                       "label": {"name": "deep-review"}},
+                      {"__typename": "LabeledEvent", "createdAt": "2026-08-24T09:00:00Z",
+                       "label": {"name": "pr-af"}}]
+            self.assertEqual(watch.latest_pr_af_label_event_seconds(events, "LabeledEvent"),
+                             watch.parse_github_time_seconds("2026-08-24T08:10:00Z"))
+
+
+class PrAfRelabelTests(unittest.TestCase):
+    """Removing and re-adding the label on the same head asks PR-AF for a fresh audit."""
+
+    def setUp(self):
+        patcher = configured(PR_AF_CONFIG)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    OLD_CHECK = _pr_af_check(started="2026-08-24T08:00:00Z", completed="2026-08-24T08:12:00Z")
+    RELABEL_EVENTS = [
+        {"__typename": "UnlabeledEvent", "createdAt": "2026-08-24T08:09:00Z", "label": {"name": "pr-af"}},
+        {"__typename": "LabeledEvent", "createdAt": "2026-08-24T08:10:00Z", "label": {"name": "pr-af"}},
+    ]
+
+    def _gate(self, pr, state, check, now):
+        gate = watch.summarize_pr_af_gate_from_checks([check])
+        gate = watch.apply_pr_af_label_rerun_grace(pr, gate, state)
+        return watch.apply_pr_af_missing_check_grace(pr, gate, state, now_seconds=now)
+
+    def test_same_sha_relabel_waits_for_a_fresh_check(self):
+        pr = _open_pr(head_sha="abc123", labels=[])
+        state = {}
+        watch.update_pr_af_label_rerun_tracking(
+            pr, state, now_seconds=watch.parse_github_time_seconds("2026-08-24T08:06:00Z"))
+        pr["labels"] = ["pr-af"]
+        relabel_at = watch.parse_github_time_seconds("2026-08-24T08:10:00Z")
+        watch.update_pr_af_label_rerun_tracking(pr, state, now_seconds=relabel_at)
+
+        gate = self._gate(pr, state, self.OLD_CHECK, relabel_at)
+        self.assertEqual(gate["status"], "missing_wait")
+        self.assertFalse(gate["is_success"])
+
+    def test_same_sha_relabel_accepts_a_newer_completed_check(self):
+        pr = _open_pr(head_sha="abc123", labels=[])
+        state = {}
+        watch.update_pr_af_label_rerun_tracking(
+            pr, state, now_seconds=watch.parse_github_time_seconds("2026-08-24T08:06:00Z"))
+        pr["labels"] = ["pr-af"]
+        relabel_at = watch.parse_github_time_seconds("2026-08-24T08:10:00Z")
+        watch.update_pr_af_label_rerun_tracking(pr, state, now_seconds=relabel_at)
+        newer = _pr_af_check(started="2026-08-24T08:20:00Z", completed="2026-08-24T08:25:00Z")
+
+        gate = self._gate(pr, state, newer, relabel_at)
+        self.assertEqual(gate["status"], "completed")
+        self.assertTrue(gate["is_success"])
+
+    def test_same_sha_relabel_between_polls_waits_for_a_fresh_check(self):
+        pr = _open_pr(head_sha="abc123", labels=["pr-af"])
+        state = {"last_snapshot_at": watch.parse_github_time_seconds("2026-08-24T08:06:00Z")}
+        relabel_at = watch.parse_github_time_seconds("2026-08-24T08:10:00Z")
+        watch.update_pr_af_label_rerun_tracking(pr, state, now_seconds=relabel_at, label_events=self.RELABEL_EVENTS)
+
+        gate = self._gate(pr, state, self.OLD_CHECK, relabel_at)
+        self.assertEqual(gate["status"], "missing_wait")
+
+    def test_same_sha_relabel_on_fresh_state_waits_for_a_fresh_check(self):
+        pr = _open_pr(head_sha="abc123", labels=["pr-af"])
+        state = {}
+        relabel_at = watch.parse_github_time_seconds("2026-08-24T08:10:00Z")
+        watch.update_pr_af_label_rerun_tracking(pr, state, now_seconds=relabel_at, label_events=self.RELABEL_EVENTS)
+
+        gate = self._gate(pr, state, self.OLD_CHECK, relabel_at)
+        self.assertEqual(gate["status"], "missing_wait")
+        self.assertFalse(gate["is_success"])
+
+
+class PrAfReviewCommentTests(unittest.TestCase):
+    """PR-AF comments come from the shared github-actions[bot] login, so they count only
+    with a known marker and only while a PR-AF check exists on the current head."""
+
+    PR = {"repo": "owner/repo", "number": 716, "head_sha": "abc123"}
+
+    def setUp(self):
+        patcher = configured(PR_AF_CONFIG)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _state():
+        return {"seen_issue_comment_ids": [], "seen_review_comment_ids": [], "seen_review_ids": [],
+                "last_review_poll_at": None}
+
+    @staticmethod
+    def _comment(body, review_id=None, login="github-actions[bot]"):
+        comment = {"id": 42, "user": {"login": login}, "author_association": "NONE",
+                   "created_at": "2026-01-01T00:00:00Z", "body": body, "path": "foo.py", "line": 1,
+                   "commit_id": "abc123", "html_url": "https://example.invalid/comment"}
+        if review_id is not None:
+            comment["pull_request_review_id"] = review_id
+        return comment
+
+    def _fetch(self, review_comments, reviews=(), gate=None):
+        with patch.object(watch, "gh_api_list_paginated", side_effect=[[], list(review_comments), list(reviews)]), \
+                patch.object(watch, "get_unresolved_review_comment_ids",
+                             return_value={"ids": {"42"}, "truncated": False}):
+            return watch.fetch_new_review_items(
+                dict(self.PR), self._state(), fresh_state=True, authenticated_login="octocat",
+                pr_af_gate=gate if gate is not None else {"present": True, "status": "completed"})
+
+    def test_unmarked_github_actions_comments_are_ignored(self):
+        new_items, blocking_items = self._fetch([self._comment("Generic workflow comment.")])
+        self.assertEqual(new_items, [])
+        self.assertEqual(blocking_items, [])
+
+    def test_marked_pr_af_comments_are_findings(self):
+        new_items, blocking_items = self._fetch([self._comment("Finding.\n\nReviewed by [PR-AF]")])
+        self.assertEqual(len(new_items), 1)
+        self.assertEqual([item["id"] for item in blocking_items], ["42"])
+
+    def test_comments_of_a_marked_parent_review_are_findings(self):
+        review = {"id": 99, "user": {"login": "github-actions[bot]"}, "author_association": "NONE",
+                  "submitted_at": "2026-01-01T00:00:00Z", "body": "## PR-AF Review \u2014 Safe to Merge",
+                  "state": "COMMENTED", "html_url": "https://example.invalid/review"}
+        new_items, blocking_items = self._fetch([self._comment("No footer here.", review_id=99)], [review])
+        self.assertEqual(len(new_items), 2)
+        self.assertEqual([item["id"] for item in blocking_items], ["42"])
+
+    def test_marker_without_a_current_pr_af_check_is_ignored(self):
+        new_items, blocking_items = self._fetch(
+            [self._comment("Echoed title: PR-AF Review \u2014 not from PR-AF")],
+            gate={"present": False, "status": "missing"})
+        self.assertEqual(new_items, [])
+        self.assertEqual(blocking_items, [])
+
+    def test_review_author_login_comes_from_config(self):
+        with configured({"pr_af": dict(PR_AF_CONFIG["pr_af"], review_author_login="pr-af-app[bot]")}):
+            new_items, _ = self._fetch([self._comment("Reviewed by [PR-AF]", login="pr-af-app[bot]")])
+        self.assertEqual(len(new_items), 1)
+
+    def test_marked_comments_are_ignored_while_pr_af_is_disabled(self):
+        with configured():
+            new_items, blocking_items = self._fetch([self._comment("Finding.\n\nReviewed by [PR-AF]")])
+        self.assertEqual(new_items, [])
+        self.assertEqual(blocking_items, [])
+
+
+class PrAfSnapshotTests(unittest.TestCase):
+    def _snapshot(self, overrides, labels, checks):
+        pr = {
+            "repo": "owner/repo", "number": 21, "head_sha": "abc123", "labels": labels,
+            "closed": False, "merged": False, "mergeable": "MERGEABLE",
+            "merge_state_status": "CLEAN", "review_decision": "",
+        }
+        args = SimpleNamespace(pr="21", repo=None, state_file=None, max_flaky_retries=3)
+        with tempfile.TemporaryDirectory() as tmp, configured(overrides), \
+                patch.object(watch, "resolve_pr", return_value=pr), \
+                patch.object(watch, "default_state_file_for", return_value=watch.Path(tmp) / "s.json"), \
+                patch.object(watch, "get_pr_checks", return_value=checks), \
+                patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                patch.object(watch, "get_pr_issue_reactions", return_value=[]), \
+                patch.object(watch, "collect_codex_gate", return_value=None), \
+                patch.object(watch, "get_recent_pr_label_events", return_value=[]) as label_lookup, \
+                patch.object(watch, "fetch_new_review_items", return_value=([], [])):
+            snapshot, _ = watch.collect_snapshot(args)
+        return snapshot, label_lookup
+
+    def test_disabled_pr_af_makes_no_pr_af_calls_and_no_pr_af_action(self):
+        snapshot, label_lookup = self._snapshot({}, ["pr-af"], [_pr_af_check("pending", "IN_PROGRESS")])
+        label_lookup.assert_not_called()
+        self.assertIsNone(snapshot["pr_af_gate"])
+        self.assertNotIn("wait_pr_af", snapshot["actions"])
+
+    def test_enabled_pr_af_reads_label_events_only_for_a_labelled_pr(self):
+        snapshot, label_lookup = self._snapshot(PR_AF_CONFIG, [], [_ci_pass()])
+        label_lookup.assert_not_called()
+        self.assertEqual(snapshot["pr_af_gate"]["status"], "missing")
+
+        snapshot, label_lookup = self._snapshot(PR_AF_CONFIG, ["pr-af"], [_ci_pass(), _pr_af_check("pending", "IN_PROGRESS")])
+        label_lookup.assert_called_once()
+        self.assertEqual(snapshot["pr_af_gate"]["status"], "in_progress")
+        self.assertIn("wait_pr_af", snapshot["actions"])
+
+    def test_wait_pr_af_is_a_passive_wait(self):
+        self.assertFalse(watch.needs_agent_attention(["idle", "wait_pr_af", "wait_codex"]))
+        self.assertTrue(watch.needs_agent_attention(["wait_pr_af", "diagnose_ci_failure"]))
+        self.assertFalse(watch.needs_agent_attention(["diagnose_branch_behind", "wait_pr_af"]))
+
+
 class SnapshotOrderingTests(unittest.TestCase):
     def test_codex_gate_is_read_before_review_comments(self):
         # If Codex posts a finding and then marks the head reviewed between the two reads,

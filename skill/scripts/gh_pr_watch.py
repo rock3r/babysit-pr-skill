@@ -418,7 +418,7 @@ def parse_pr_spec(pr_spec):
 def pr_view_fields():
     return (
         "number,url,state,mergedAt,closedAt,headRefName,headRefOid,"
-        "headRepository,headRepositoryOwner,mergeable,mergeStateStatus,reviewDecision"
+        "headRepository,headRepositoryOwner,mergeable,mergeStateStatus,reviewDecision,labels"
     )
 
 
@@ -461,7 +461,24 @@ def resolve_pr(pr_spec, repo_override=None):
         "mergeable": str(data.get("mergeable") or ""),
         "merge_state_status": str(data.get("mergeStateStatus") or ""),
         "review_decision": str(data.get("reviewDecision") or ""),
+        "labels": normalize_pr_labels(data.get("labels")),
     }
+
+
+def normalize_pr_labels(raw_labels):
+    if not isinstance(raw_labels, list):
+        return []
+    labels = []
+    for label in raw_labels:
+        name = str(label.get("name") or "") if isinstance(label, dict) else str(label or "")
+        if name:
+            labels.append(name)
+    return labels
+
+
+def pr_has_label(pr, label_name):
+    wanted = str(label_name or "").lower()
+    return any(str(label).lower() == wanted for label in pr.get("labels") or [])
 
 
 def extract_repo_from_pr_view(data):
@@ -504,6 +521,11 @@ def reset_seen_tracking_state(state):
     state["pending_checks_first_seen_at"] = {}
     state["checks_went_terminal_at"] = None
     state["checks_terminal_sha"] = None
+    state["pr_af_missing_since_at"] = None
+    state["pr_af_missing_sha"] = None
+    state["pr_af_label_absent_sha"] = None
+    state["pr_af_label_rerun_sha"] = None
+    state["pr_af_label_rerun_seen_at"] = None
 
 
 def is_state_stale(state, now_seconds=None):
@@ -553,6 +575,17 @@ def load_state(path):
         # identity. This allows hung detection even when `startedAt` is not
         # provided by GitHub for queued/blocked checks.
         "pending_checks_first_seen_at": {},
+        # First-seen unix seconds for a labelled head whose PR-AF check has not
+        # appeared yet. This closes the label-on-green race and still ends the
+        # wait when GitHub never starts a run.
+        "pr_af_missing_since_at": None,
+        "pr_af_missing_sha": None,
+        # Same-SHA relabel tracking. When the PR-AF label goes away and comes back
+        # on the same head, a PR-AF check from before that must not count for the
+        # newly requested audit.
+        "pr_af_label_absent_sha": None,
+        "pr_af_label_rerun_sha": None,
+        "pr_af_label_rerun_seen_at": None,
     }, True
 
 
@@ -611,6 +644,9 @@ def summarize_checks(checks):
     passed_count = 0
     skipping_count = 0
     for check in checks:
+        # PR-AF is advisory: its own gate reports it, and its result is never a CI failure.
+        if is_optional_review_check(check):
+            continue
         bucket = str(check.get("bucket") or "").lower()
         if is_pending_check(check):
             pending_count += 1
@@ -722,6 +758,8 @@ def failed_runs_from_workflow_runs(runs, head_sha):
         if conclusion not in FAILED_RUN_CONCLUSIONS:
             continue
         workflow_name = run.get("name") or run.get("display_title") or ""
+        if is_optional_review_name(workflow_name):
+            continue
         failed_runs.append(
             {
                 "run_id": run.get("id"),
@@ -736,6 +774,255 @@ def failed_runs_from_workflow_runs(runs, head_sha):
         key=lambda item: (str(item.get("workflow_name") or ""), str(item.get("run_id") or ""))
     )
     return failed_runs
+
+
+def normalize_review_name(name):
+    return " ".join(str(name or "").lower().split())
+
+
+def is_pr_af_name(name):
+    """Whether a check, job, or workflow name belongs to PR-AF.
+
+    The match is exact after normalising case and spaces, so a job such as
+    "verify-pr-after-rebase" never matches by accident.
+    """
+    pr_af = CONFIG["pr_af"]
+    if not pr_af["enabled"]:
+        return False
+    names = {normalize_review_name(item) for item in pr_af["workflow_names"] + pr_af["check_names"]}
+    return normalize_review_name(name) in names
+
+
+def is_optional_review_name(name):
+    return is_pr_af_name(name)
+
+
+def is_optional_review_check(check):
+    return is_optional_review_name(check.get("name")) or is_optional_review_name(check.get("workflow"))
+
+
+def review_check_activity_sort_key(check):
+    started = str(check.get("startedAt") or "")
+    completed = str(check.get("completedAt") or "")
+    return (max(started, completed), started, completed, str(check.get("name") or ""))
+
+
+def summarize_pr_af_gate_from_checks(checks):
+    """Summarise the latest PR-AF check on the current head."""
+    pr_af_checks = [
+        check for check in checks
+        if isinstance(check, dict)
+        and (is_pr_af_name(check.get("name")) or is_pr_af_name(check.get("workflow")))
+    ]
+    if not pr_af_checks:
+        return {
+            "required": False,
+            "present": False,
+            "status": "missing",
+            "conclusion": "",
+            "is_success": False,
+            "workflow_name": "",
+            "html_url": "",
+            "source": "checks",
+        }
+
+    # A pending rerun wins over an older completed run.
+    pending = [check for check in pr_af_checks if is_pending_check(check)]
+    candidates = pending or pr_af_checks
+    latest = sorted(candidates, key=review_check_activity_sort_key)[-1]
+    state = str(latest.get("state") or "").upper()
+    bucket = str(latest.get("bucket") or "").lower()
+
+    if is_pending_check(latest):
+        status, conclusion = "in_progress", ""
+    elif bucket == "pass" or state == "SUCCESS":
+        status, conclusion = "completed", "success"
+    elif bucket == "skipping" or state == "SKIPPING":
+        status, conclusion = "completed", "skipped"
+    elif state == "NEUTRAL":
+        status, conclusion = "completed", "neutral"
+    elif bucket == "fail":
+        status, conclusion = "completed", "failure"
+    elif state:
+        status, conclusion = "completed", state.lower()
+    else:
+        status, conclusion = "in_progress", ""
+
+    return {
+        "required": False,
+        "present": True,
+        "status": status,
+        "conclusion": conclusion,
+        "is_success": status == "completed" and conclusion == "success",
+        "workflow_name": str(latest.get("name") or ""),
+        "html_url": str(latest.get("link") or ""),
+        "started_at": str(latest.get("startedAt") or ""),
+        "completed_at": str(latest.get("completedAt") or ""),
+        "source": "checks",
+    }
+
+
+def get_recent_pr_label_events(repo, pr_number):
+    """The last 20 label and unlabel events of the PR."""
+    query = """
+    query($owner:String!, $name:String!, $number:Int!) {
+      repository(owner:$owner, name:$name) {
+        pullRequest(number:$number) {
+          timelineItems(last:20, itemTypes:[LABELED_EVENT, UNLABELED_EVENT]) {
+            nodes {
+              __typename
+              ... on LabeledEvent { createdAt label { name } }
+              ... on UnlabeledEvent { createdAt label { name } }
+            }
+          }
+        }
+      }
+    }
+    """
+    owner, name = repo.split("/", 1)
+    data = gh_json(
+        [
+            "api", "graphql",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-F", f"number={int(pr_number)}",
+            "-f", f"query={query}",
+        ],
+        repo=repo,
+    )
+    try:
+        nodes = data["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+    except (TypeError, KeyError):
+        return []
+    return [node for node in nodes or [] if isinstance(node, dict)]
+
+
+def parse_github_time_seconds(value):
+    text = str(value or "")
+    if not text:
+        return None
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def latest_pr_af_label_event_seconds(label_events, typename):
+    wanted = str(CONFIG["pr_af"]["label"]).lower()
+    latest = None
+    for event in label_events or []:
+        if str(event.get("__typename") or "") != typename:
+            continue
+        label = event.get("label") or {}
+        if str(label.get("name") or "").lower() != wanted:
+            continue
+        event_seconds = parse_github_time_seconds(event.get("createdAt"))
+        if event_seconds is None:
+            continue
+        latest = event_seconds if latest is None else max(latest, event_seconds)
+    return latest
+
+
+def pr_af_label_events_needed(pr, state):
+    """Label events matter only for a labelled head that was never seen without the label."""
+    return (
+        pr_has_label(pr, CONFIG["pr_af"]["label"])
+        and state.get("pr_af_label_absent_sha") != str(pr.get("head_sha") or "")
+    )
+
+
+def update_pr_af_label_rerun_tracking(pr, state, now_seconds, label_events=None):
+    """Track a PR-AF label that was removed and added again on the same head SHA."""
+    head_sha = str(pr.get("head_sha") or "")
+    if not head_sha:
+        return
+    if not pr_has_label(pr, CONFIG["pr_af"]["label"]):
+        state["pr_af_label_absent_sha"] = head_sha
+        state["pr_af_label_rerun_sha"] = None
+        state["pr_af_label_rerun_seen_at"] = None
+        return
+    if state.get("pr_af_label_absent_sha") != head_sha:
+        # The watcher never saw this head without the label. The timeline tells
+        # whether the label was re-added between polls or before the watch started.
+        latest_labeled_at = latest_pr_af_label_event_seconds(label_events, "LabeledEvent")
+        latest_unlabeled_at = latest_pr_af_label_event_seconds(label_events, "UnlabeledEvent")
+        if latest_labeled_at is None or (
+            latest_unlabeled_at is not None and latest_unlabeled_at > latest_labeled_at
+        ):
+            return
+        state["pr_af_label_absent_sha"] = head_sha
+        state["pr_af_label_rerun_sha"] = head_sha
+        state["pr_af_label_rerun_seen_at"] = latest_labeled_at
+        return
+    if state.get("pr_af_label_rerun_sha") != head_sha:
+        state["pr_af_label_rerun_sha"] = head_sha
+        state["pr_af_label_rerun_seen_at"] = int(now_seconds)
+
+
+def apply_pr_af_label_rerun_grace(pr, pr_af_gate, state):
+    """Ignore a completed PR-AF check that started before the label was re-added."""
+    if not pr_has_label(pr, CONFIG["pr_af"]["label"]):
+        return pr_af_gate
+    if str(pr_af_gate.get("status") or "") != "completed":
+        return pr_af_gate
+    if state.get("pr_af_label_rerun_sha") != str(pr.get("head_sha") or ""):
+        return pr_af_gate
+    try:
+        rerun_seen_at = int(state.get("pr_af_label_rerun_seen_at") or 0)
+    except (TypeError, ValueError):
+        return pr_af_gate
+    started_at = parse_github_time_seconds(pr_af_gate.get("started_at"))
+    if started_at is None or started_at >= rerun_seen_at:
+        return pr_af_gate
+
+    gate = dict(pr_af_gate)
+    gate.update({
+        "present": False,
+        "status": "missing",
+        "conclusion": "",
+        "is_success": False,
+        "stale_started_at": pr_af_gate.get("started_at"),
+    })
+    return gate
+
+
+def apply_pr_af_missing_check_grace(pr, pr_af_gate, state, now_seconds):
+    """Wait a bounded time for the PR-AF check of a labelled head to appear."""
+    if not pr_has_label(pr, CONFIG["pr_af"]["label"]) or str(pr_af_gate.get("status") or "") != "missing":
+        state["pr_af_missing_since_at"] = None
+        state["pr_af_missing_sha"] = None
+        return pr_af_gate
+
+    head_sha = str(pr.get("head_sha") or "")
+    if state.get("pr_af_missing_sha") != head_sha:
+        state["pr_af_missing_sha"] = head_sha
+        state["pr_af_missing_since_at"] = int(now_seconds)
+    try:
+        first_seen = int(state.get("pr_af_missing_since_at") or now_seconds)
+    except (TypeError, ValueError):
+        first_seen = int(now_seconds)
+        state["pr_af_missing_since_at"] = first_seen
+
+    elapsed = max(0, int(now_seconds) - first_seen)
+    gate = dict(pr_af_gate)
+    gate["missing_elapsed_seconds"] = elapsed
+    grace_seconds = int(CONFIG["pr_af"]["missing_check_grace_minutes"]) * 60
+    gate["status"] = "missing_wait" if elapsed < grace_seconds else "missing_timeout"
+    return gate
+
+
+def pr_af_holds_readiness(pr_af_gate):
+    return bool(pr_af_gate) and str(pr_af_gate.get("status") or "") in {"in_progress", "missing_wait"}
+
+
+def collect_pr_af_gate(pr, checks, state, now_seconds):
+    label_events = None
+    if pr_af_label_events_needed(pr, state):
+        label_events = get_recent_pr_label_events(pr["repo"], pr["number"])
+    update_pr_af_label_rerun_tracking(pr, state, now_seconds, label_events=label_events)
+    gate = summarize_pr_af_gate_from_checks(checks)
+    gate = apply_pr_af_label_rerun_grace(pr, gate, state)
+    return apply_pr_af_missing_check_grace(pr, gate, state, now_seconds)
 
 
 def is_codex_bot_login(login):
@@ -1254,10 +1541,40 @@ def is_actionable_review_bot_login(login):
     return any(keyword.lower() in lower_login for keyword in keywords)
 
 
-def is_actionable_review_bot_item(item):
+def is_pr_af_review_item(item, pr_af_review_ids=None, pr_af_check_present=True):
+    """A PR-AF finding: the configured author, plus a known marker or a marked parent review.
+
+    PR-AF usually posts as the shared github-actions[bot] login. A marker counts only
+    while a PR-AF check exists on the current head, so an ordinary workflow comment
+    cannot become a finding by echoing the marker text.
+    """
+    pr_af = CONFIG["pr_af"]
+    if not pr_af["enabled"] or not pr_af_check_present:
+        return False
+    if str(item.get("author") or "").lower() != str(pr_af["review_author_login"]).lower():
+        return False
+    review_id = str(item.get("review_id") or "")
+    if review_id and review_id in (pr_af_review_ids or set()):
+        return True
+    body = str(item.get("body") or "").lower()
+    return any(marker.lower() in body for marker in pr_af["review_body_markers"])
+
+
+def is_pr_af_author(item):
+    pr_af = CONFIG["pr_af"]
+    return bool(pr_af["enabled"]) and (
+        str(item.get("author") or "").lower() == str(pr_af["review_author_login"]).lower()
+    )
+
+
+def is_actionable_review_bot_item(item, pr_af_review_ids=None, pr_af_check_present=True):
     author = str(item.get("author") or "")
     if STATUS_ONLY_BOT_COMMENT_MARKER in str(item.get("body") or ""):
         return False
+    if is_pr_af_author(item):
+        return is_pr_af_review_item(
+            item, pr_af_review_ids=pr_af_review_ids, pr_af_check_present=pr_af_check_present
+        )
     return is_actionable_review_bot_login(author)
 
 
@@ -1270,7 +1587,7 @@ def is_trusted_human_review_author(item, authenticated_login):
     return association in {str(item).upper() for item in CONFIG["trusted_author_associations"]}
 
 
-def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
+def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None, pr_af_gate=None):
     repo = pr["repo"]
     pr_number = pr["number"]
     head_sha = str(pr.get("head_sha") or "")
@@ -1297,6 +1614,12 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
     review_comment_items = normalize_review_comments(review_comment_payload)
     review_items = normalize_reviews(review_payload)
     all_items = issue_items + review_comment_items + review_items
+    pr_af_check_present = bool((pr_af_gate or {}).get("present"))
+    pr_af_review_ids = {
+        str(item.get("id") or "")
+        for item in review_items
+        if is_pr_af_review_item(item, pr_af_check_present=pr_af_check_present)
+    }
 
     # Look up unresolved review threads via GraphQL when there are any review
     # comments at all.  Unresolved threads block merge regardless of which
@@ -1355,7 +1678,9 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
                 blocking_items.append(item)
             continue
         if is_bot_login(author):
-            if not is_actionable_review_bot_item(item):
+            if not is_actionable_review_bot_item(
+                item, pr_af_review_ids=pr_af_review_ids, pr_af_check_present=pr_af_check_present
+            ):
                 continue
         elif not is_trusted_human_review_author(item, authenticated_login):
             continue
@@ -1499,6 +1824,7 @@ def is_pr_ready_to_merge(
     blocking_review_items=None,
     codex_gate=None,
     coderabbit_gate=None,
+    pr_af_gate=None,
 ):
     if pr["closed"] or pr["merged"]:
         return False
@@ -1529,6 +1855,8 @@ def is_pr_ready_to_merge(
     if codex_required() and not (codex_gate and codex_gate.get("head_reviewed")):
         return False
     if coderabbit_gate and bool(coderabbit_gate.get("reviewing")):
+        return False
+    if pr_af_holds_readiness(pr_af_gate):
         return False
     # A failed reactions lookup means we cannot tell whether Codex is still reviewing.
     if codex_gate and str(codex_gate.get("status") or "") == "unknown":
@@ -1614,6 +1942,11 @@ def reset_state_for_new_head_sha(state, head_sha):
     current_sha = str(head_sha or "")
     if previous_sha and current_sha and previous_sha != current_sha:
         state["pending_checks_first_seen_at"] = {}
+        state["pr_af_missing_since_at"] = None
+        state["pr_af_missing_sha"] = None
+        state["pr_af_label_absent_sha"] = None
+        state["pr_af_label_rerun_sha"] = None
+        state["pr_af_label_rerun_seen_at"] = None
 
 
 def update_pending_checks_first_seen(state, checks, now_seconds):
@@ -1651,6 +1984,8 @@ def hung_checks_from_checks(checks, pending_checks_first_seen_at):
     now = time.time()
     for check in checks:
         if not is_pending_check(check):
+            continue
+        if is_optional_review_check(check):
             continue
 
         started_at = None
@@ -1704,6 +2039,7 @@ def recommend_actions(
     blocking_review_items=None,
     codex_gate=None,
     coderabbit_gate=None,
+    pr_af_gate=None,
 ):
     actions = []
     if pr["closed"] or pr["merged"]:
@@ -1735,6 +2071,7 @@ def recommend_actions(
         blocking_review_items=blocking_review_items,
         codex_gate=codex_gate,
         coderabbit_gate=coderabbit_gate,
+        pr_af_gate=pr_af_gate,
     ):
         actions.append("stop_ready_to_merge")
         return unique_actions(actions)
@@ -1757,6 +2094,9 @@ def recommend_actions(
 
     if coderabbit_gate and bool(coderabbit_gate.get("reviewing")):
         actions.append("wait_coderabbit")
+
+    if pr_af_holds_readiness(pr_af_gate):
+        actions.append("wait_pr_af")
 
     if hung_checks:
         actions.append("diagnose_hung_check")
@@ -1808,6 +2148,7 @@ def collect_snapshot(args):
     checks_summary = summarize_checks(checks)
     pending_checks_first_seen_at = update_pending_checks_first_seen(state, checks, now)
     hung_checks = hung_checks_from_checks(checks, pending_checks_first_seen_at)
+    pr_af_gate = collect_pr_af_gate(pr, checks, state, now) if CONFIG["pr_af"]["enabled"] else None
 
     workflow_runs = []
     failed_runs = []
@@ -1833,6 +2174,7 @@ def collect_snapshot(args):
         state,
         fresh_state=fresh_state,
         authenticated_login=authenticated_login,
+        pr_af_gate=pr_af_gate,
     )
 
     # Track when checks first went all_terminal for the current head SHA.
@@ -1874,6 +2216,7 @@ def collect_snapshot(args):
         blocking_review_items=blocking_review_items,
         codex_gate=codex_gate,
         coderabbit_gate=coderabbit_gate,
+        pr_af_gate=pr_af_gate,
     )
 
     state["pr"] = {"repo": pr["repo"], "number": pr["number"]}
@@ -1887,6 +2230,7 @@ def collect_snapshot(args):
         "failed_runs": failed_runs,
         "codex_gate": codex_gate,
         "coderabbit_gate": coderabbit_gate,
+        "pr_af_gate": pr_af_gate,
         "hung_checks": hung_checks,
         "new_review_items": new_review_items,
         "blocking_review_items": blocking_review_items,
@@ -1994,6 +2338,7 @@ def is_ci_green(snapshot):
     codex_gate = snapshot.get("codex_gate") or {}
     codex_reviewing = bool(codex_gate.get("reviewing"))
     coderabbit_reviewing = bool((snapshot.get("coderabbit_gate") or {}).get("reviewing"))
+    pr_af_running = str((snapshot.get("pr_af_gate") or {}).get("status") or "") == "in_progress"
     return (
         bool(checks.get("all_terminal"))
         and has_green_check_set(checks)
@@ -2003,6 +2348,7 @@ def is_ci_green(snapshot):
         and review_decision not in MERGE_BLOCKING_REVIEW_DECISIONS
         and not codex_reviewing
         and not coderabbit_reviewing
+        and not pr_af_running
     )
 
 
@@ -2034,6 +2380,8 @@ def snapshot_change_key(snapshot):
         tuple(snapshot.get("actions") or []),
         bool(codex_gate.get("reviewing")),
         bool((snapshot.get("coderabbit_gate") or {}).get("reviewing")),
+        str((snapshot.get("pr_af_gate") or {}).get("status") or ""),
+        str((snapshot.get("pr_af_gate") or {}).get("conclusion") or ""),
         # Include whether the checks-terminal grace period is still active.
         # This flips exactly once (True → False) when the grace period expires,
         # ensuring the change-key transitions at that moment and preventing the
@@ -2055,6 +2403,7 @@ def _grace_period_active(snapshot):
 BOT_WAIT_ACTIONS = {
     "wait_codex",
     "wait_coderabbit",
+    "wait_pr_af",
 }
 PASSIVE_WAIT_ACTIONS = {"idle"} | BOT_WAIT_ACTIONS
 # Actions that ask the agent to update the branch, which starts new bot reviews.
