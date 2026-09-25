@@ -2,6 +2,17 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 1.0.1
+
+### Fixed
+
+- A PR without any check made `gh pr checks` exit with "no checks reported", and the watcher treated that as a
+  failed command. `--snapshot` stopped with an error, and `--once` retried until the session timeout. The watcher
+  now reads it as an empty check list. Other failures of `gh pr checks` still stop the poll.
+- An empty check set is still never ready. After the grace period, the watcher now ends the wait with the new
+  `diagnose_no_checks` action instead of idling until the session timeout.
+- The `checks` summary now has `check_count`, the number of checks that GitHub reported.
+
 ## 1.0.0
 
 The first release of the central skill. It merges the copies that several repositories carried into one version,

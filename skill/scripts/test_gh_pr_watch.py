@@ -1472,6 +1472,65 @@ class RequiredChecksTests(unittest.TestCase):
         actions = _actions_for(_open_pr(merge_state_status="BLOCKED"), _green_checks(passed_count=0))
         self.assertEqual(actions, ["idle"])
 
+    def test_summary_counts_every_check_that_gh_reported(self):
+        self.assertEqual(watch.summarize_checks([])["check_count"], 0)
+        checks = [{"name": "build", "bucket": "pass", "state": "SUCCESS"},
+                  {"name": "deploy", "bucket": "skipping", "state": "SKIPPED"}]
+        with configured({"expected_skipped_checks": ["deploy"]}):
+            self.assertEqual(watch.summarize_checks(checks)["check_count"], 2)
+
+    def test_pr_without_checks_waits_during_the_grace_period(self):
+        actions = _actions_for(_open_pr(), _green_checks(passed_count=0, check_count=0),
+                               checks_terminal_elapsed=10)
+        self.assertEqual(actions, ["idle"])
+
+    def test_pr_without_checks_is_diagnosed_after_the_grace_period(self):
+        actions = _actions_for(_open_pr(), _green_checks(passed_count=0, check_count=0))
+        self.assertEqual(actions, ["diagnose_no_checks"])
+        self.assertTrue(watch.needs_agent_attention(actions))
+        self.assertTrue(watch.should_stop_watching(actions))
+
+    def test_no_checks_wins_over_an_unexplained_block(self):
+        actions = _actions_for(_open_pr(merge_state_status="BLOCKED"),
+                               _green_checks(passed_count=0, check_count=0))
+        self.assertEqual(actions, ["diagnose_no_checks"])
+
+    def test_draft_without_checks_still_asks_for_ready_for_review(self):
+        actions = _actions_for(_open_pr(merge_state_status="DRAFT"),
+                               _green_checks(passed_count=0, check_count=0))
+        self.assertEqual(actions, ["stop_draft_pr"])
+
+    def test_once_returns_diagnose_no_checks_instead_of_idling(self):
+        # End to end: gh says "no checks reported", the first poll starts the grace
+        # period, and a later poll hands the PR back to the agent.
+        pr = {"repo": "owner/repo", "number": 21, "head_sha": "abc123", "labels": [],
+              "closed": False, "merged": False, "mergeable": "MERGEABLE",
+              "merge_state_status": "CLEAN", "review_decision": ""}
+        clock = [1000.0]
+
+        def fake_gh(cmd, check=False, **_kwargs):
+            raise watch.subprocess.CalledProcessError(
+                1, cmd, output="", stderr="no checks reported on the 'feature' branch")
+
+        def advancing_sleep(seconds):
+            clock[0] += seconds
+
+        with tempfile.TemporaryDirectory() as tmp, configured(), \
+                patch.object(watch, "resolve_pr", return_value=pr), \
+                patch.object(watch.subprocess, "run", side_effect=fake_gh), \
+                patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                patch.object(watch, "collect_codex_gate", return_value=None), \
+                patch.object(watch, "get_pr_issue_reactions", return_value=[]), \
+                patch.object(watch, "fetch_new_review_items", return_value=([], [])), \
+                patch.object(watch.time, "time", side_effect=lambda: clock[0]), \
+                patch.object(watch.time, "sleep", side_effect=advancing_sleep):
+            result = watch.run_once(SimpleNamespace(
+                pr="21", repo=None, state_file=str(watch.Path(tmp) / "s.json"), poll_seconds=30,
+                max_flaky_retries=3, max_session_minutes=90))
+
+        self.assertEqual(result["actions"], ["diagnose_no_checks"])
+        self.assertEqual(result["checks"]["check_count"], 0)
+
     def test_empty_check_set_is_not_green_for_backoff(self):
         snapshot = {
             "pr": {"review_decision": "APPROVED"},
@@ -2459,6 +2518,13 @@ class GhCommandHardeningTests(unittest.TestCase):
             with self.assertRaises(watch.GhCommandError) as context:
                 watch.gh_text(["pr", "view"])
         self.assertIn("timed out", str(context.exception))
+
+    def test_a_pr_without_any_checks_gives_an_empty_check_list(self):
+        # A PR whose workflows never run has no checks at all. gh reports that with exit
+        # code 1, no JSON, and "no checks reported". It is a state, not a failure.
+        fake = self._fake_gh_run(1, "", stderr="no checks reported on the 'feature' branch")
+        with patch.object(watch.subprocess, "run", side_effect=fake):
+            self.assertEqual(watch.get_pr_checks("21", repo="owner/repo"), [])
 
     def test_other_exit_codes_still_fail_even_with_output(self):
         fake = self._fake_gh_run(4, '{"message": "authentication required"}')

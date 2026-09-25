@@ -94,8 +94,8 @@ The output is JSON lines. Where the actions are depends on the mode:
 | `--retry-failed-now` | `snapshot.actions`. The top level reports the rerun: `rerun_attempted`, `rerun_count`, `reason`. |
 | `--watch` | `payload.snapshot.actions` on `snapshot` events, `payload.actions` on `stop` events |
 
-Other useful snapshot fields are `checks` (pending, failed, passed and skipping counts, `all_terminal`, and
-`required_missing`), `failed_runs` (with `retry_eligible`), `codex_gate`, `coderabbit_gate`, `pr_af_gate`,
+Other useful snapshot fields are `checks` (pending, failed, passed and skipping counts, `all_terminal`,
+`required_missing`, and `check_count`), `failed_runs` (with `retry_eligible`), `codex_gate`, `coderabbit_gate`, `pr_af_gate`,
 `hung_checks`, `new_review_items`, `blocking_review_items`, and `retry_state`.
 
 `blocking_review_items` lists unresolved inline comments. While it is not empty, the watcher never reports the PR
@@ -121,6 +121,7 @@ again.
 | `diagnose_merge_conflict` | The PR is `CONFLICTING` or `DIRTY`. It waits while a review bot runs. | yes | yes |
 | `diagnose_branch_behind` | The branch is behind its base and branch protection wants it updated. It waits while a review bot runs. | yes | yes |
 | `diagnose_merge_blocked` | Every check is green, but GitHub still says `BLOCKED` and nothing else explains it. | yes | yes |
+| `diagnose_no_checks` | GitHub reports no check at all for the PR, even after the grace period. | yes | yes |
 | `diagnose_missing_required_checks` | Every check is done, but a check from `required_checks` never passed. See `checks.required_missing`. | yes | yes |
 | `diagnose_hung_check` | A check has been pending for longer than `hung_check_minutes`. | yes | yes |
 | `diagnose_skipping_checks` | A check that should run was skipped or neutral. Find out why. | yes | yes |
@@ -136,6 +137,9 @@ What to do for the less obvious ones:
 - `diagnose_merge_blocked`: the usual causes are a required status check that never reports, a required review
   from a code owner, a required signature, or a repository ruleset. Look at the branch rules with
   `gh api repos/{owner}/{repo}/rules/branches/<base>`. Tell the owner what blocks the merge. Never bypass it.
+- `diagnose_no_checks`: find out why no workflow runs on this PR. Common causes are path or branch filters, a
+  disabled workflow, a PR from a fork that needs approval to run workflows, or a repository without CI. Tell the
+  owner. A PR without checks is never reported as ready.
 - `diagnose_missing_required_checks`: find out why the check did not run. Common causes are path filters, a
   disabled workflow, or a trigger that does not fire on PRs.
 - `diagnose_codex_review`: read the Codex summary comment on the PR. If the review failed, ask again with

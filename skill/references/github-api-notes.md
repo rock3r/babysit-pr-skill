@@ -25,8 +25,9 @@ is done. `bucket` values are `pass`, `fail`, `pending`, `skipping`, and `cancel`
 failure.
 
 `gh pr checks` exits with code 1 when a check failed and with code 8 while checks are pending. In both cases it
-still prints the requested JSON, so the watcher reads that JSON. Without JSON, or with any other non-zero exit code,
-the call counts as failed.
+still prints the requested JSON, so the watcher reads that JSON. A PR without any check also makes it exit with code
+1, with no JSON and the message "no checks reported". The watcher reads that as an empty check list. Without JSON in
+any other case, or with any other non-zero exit code, the call counts as failed.
 
 ### Workflow runs for the head SHA
 

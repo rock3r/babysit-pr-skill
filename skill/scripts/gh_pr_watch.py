@@ -359,7 +359,7 @@ def _format_gh_error(cmd, err):
     return "\n".join(parts)
 
 
-def gh_text(args, repo=None, ok_exit_codes=(0,)):
+def gh_text(args, repo=None, ok_exit_codes=(0,), empty_result_stderr=()):
     cmd = ["gh"]
     # `gh api` does not accept `-R/--repo` on all gh versions. The watcher's
     # API calls use explicit endpoints (e.g. repos/{owner}/{repo}/...), so the
@@ -386,6 +386,11 @@ def gh_text(args, repo=None, ok_exit_codes=(0,)):
     except subprocess.CalledProcessError as err:
         if err.returncode in ok_exit_codes and (err.stdout or "").strip():
             return err.stdout
+        # Some "nothing to report" answers come as an error with a known message.
+        if err.returncode in ok_exit_codes and any(
+            marker in (err.stderr or "") for marker in empty_result_stderr
+        ):
+            return ""
         raise GhCommandError(_format_gh_error(cmd, err)) from err
     if proc.stdout is None:
         # `subprocess` leaves stdout as None when its reader thread dies, which would
@@ -394,8 +399,10 @@ def gh_text(args, repo=None, ok_exit_codes=(0,)):
     return proc.stdout
 
 
-def gh_json(args, repo=None, ok_exit_codes=(0,)):
-    raw = gh_text(args, repo=repo, ok_exit_codes=ok_exit_codes).strip()
+def gh_json(args, repo=None, ok_exit_codes=(0,), empty_result_stderr=()):
+    raw = gh_text(
+        args, repo=repo, ok_exit_codes=ok_exit_codes, empty_result_stderr=empty_result_stderr
+    ).strip()
     if not raw:
         return None
     try:
@@ -619,7 +626,14 @@ def get_pr_checks(pr_spec, repo):
     cmd.extend(["--json", checks_fields()])
     # `gh pr checks` exits 1 when a check failed and 8 while checks are pending, and still
     # prints the requested JSON. Those are states to report, not command failures.
-    data = gh_json(cmd, repo=repo, ok_exit_codes=GH_PR_CHECKS_STATE_EXIT_CODES)
+    # A PR without any check makes gh exit 1 with "no checks reported" and no JSON.
+    # That is an empty check list. Any other exit 1 without JSON is still a failure.
+    data = gh_json(
+        cmd,
+        repo=repo,
+        ok_exit_codes=GH_PR_CHECKS_STATE_EXIT_CODES,
+        empty_result_stderr=("no checks reported",),
+    )
     if data is None:
         return []
     if not isinstance(data, list):
@@ -668,6 +682,8 @@ def summarize_checks(checks):
         "skipping_count": skipping_count,
         "all_terminal": pending_count == 0,
         "required_missing": missing_required_checks(checks),
+        # Every check gh reported, including expected skips and advisory checks.
+        "check_count": len(checks),
     }
 
 
@@ -1911,6 +1927,18 @@ def grace_period_elapsed(checks_terminal_elapsed):
     )
 
 
+def has_no_checks(checks_summary, checks_terminal_elapsed):
+    """GitHub reports no check at all for the PR, even after the grace period.
+
+    Right after a push the checks may not be registered yet, so the grace period comes
+    first. After that, an empty check set means no workflow runs on this PR. Waiting
+    would only end at the session timeout.
+    """
+    if checks_summary.get("check_count") != 0:
+        return False
+    return grace_period_elapsed(checks_terminal_elapsed)
+
+
 def is_required_check_missing(checks_summary, checks_terminal_elapsed):
     """Every check is done, but a required check never passed or never appeared."""
     if not checks_summary.get("required_missing"):
@@ -2119,6 +2147,9 @@ def recommend_actions(
                     actions.append("retry_failed_checks")
             else:
                 actions.append("stop_non_retryable_failure")
+
+    if not actions and has_no_checks(checks_summary, checks_terminal_elapsed):
+        actions.append("diagnose_no_checks")
 
     if not actions and is_required_check_missing(checks_summary, checks_terminal_elapsed):
         actions.append("diagnose_missing_required_checks")
@@ -2439,6 +2470,8 @@ def should_stop_watching(actions):
     if "diagnose_merge_blocked" in action_set:
         return True
     if "diagnose_missing_required_checks" in action_set:
+        return True
+    if "diagnose_no_checks" in action_set:
         return True
     if "stop_pr_closed" in action_set:
         return True
