@@ -2,6 +2,28 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 2.2.0
+
+This is a minor release: it adds the `codex.idle_wait_minutes` config key and fixes behaviour.
+
+### Fixed
+
+- With `require_up_to_date: "auto"`, a 403 from the branch-protection lookup counted as "not required". That endpoint
+  needs repository administration access, so a collaborator token gets 403 even when strict up-to-date checks are
+  required, and free private repositories answer 403 as well. A BEHIND PR could then get `stop_ready_to_merge`. Now
+  only definitive answers mean "not required": a 404 that says the branch has no protection or no required checks,
+  or `strict: false`, and in both cases no strict ruleset. A 403, any other 404, and every other failure count as
+  required, and the watcher does not cache them. A repository that knows it has no strict rule can set
+  `require_up_to_date: false`.
+- The watcher waited until the session timeout on a PR where Codex was active but never reviewed the new head. Once
+  the checks are done and the grace period has passed, with no 👀 reaction and no running or completed review of the
+  head:
+  - with `codex.required`, the watcher emits `request_codex_review`, and `--once` returns for it;
+  - without it, the watcher waits `codex.idle_wait_minutes` (new, default 10). After that the missing review no longer
+    blocks readiness, and `codex_gate.idle_wait_expired` and `codex_gate.note` say that Codex did not review the head.
+
+  A running Codex review still blocks as before.
+
 ## 2.1.0
 
 This is a minor release: it adds two config keys and fixes behaviour, and it removes no action or key.

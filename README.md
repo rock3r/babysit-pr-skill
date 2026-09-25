@@ -32,7 +32,7 @@ Clone this repository once, then run `sync.py` with the path of the repository t
 
 ```bash
 git clone https://github.com/rock3r/babysit-pr-skill.git
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.1.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.2.0
 ```
 
 `sync.py` does the following:
@@ -52,7 +52,7 @@ edit `config.json` for the repository, and commit the folder.
 
 ```bash
 git -C babysit-pr-skill pull --tags
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.2.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.3.0
 ```
 
 Read [CHANGELOG.md](CHANGELOG.md) for the versions in between. Your `config.json` stays as it is. New config keys
@@ -77,9 +77,10 @@ of the wrong type stops the watcher with an error that names the key.
 | `trusted_author_associations` | list of strings | `["OWNER", "MEMBER", "COLLABORATOR"]` | Comments from these author associations are review items. |
 | `review_bot_login_keywords` | list of strings | `["codex"]` | Comments from `[bot]` accounts whose login contains one of these words are review items. |
 | `max_session_minutes` | integer | `90` | The default for `--max-session-minutes`. |
-| `require_up_to_date` | `"auto"`, `true`, or `false` | `"auto"` | Whether a PR that is behind its base must be updated before merge. `"auto"` reads the base branch's required status checks and rulesets once per run: only a strict (up-to-date) requirement counts. A 403 or 404 answer means not required. Any other failed lookup counts as required. |
+| `require_up_to_date` | `"auto"`, `true`, or `false` | `"auto"` | Whether a PR that is behind its base must be updated before merge. `"auto"` reads the base branch's required status checks and rulesets once per run: only a strict (up-to-date) requirement counts. Only a definitive answer means "not required": a 404 that says the branch has no protection or no required checks, or `strict: false`, and in both cases no strict ruleset. A 403 (the endpoint needs admin access, and free private repositories answer 403 too), any other 404, and every other failure count as required. A repository that knows it has no strict rule can set `false`. |
 | `codex.enabled` | boolean | `true` | Watch the Codex review bot. When `false`, the watcher makes no Codex calls. |
 | `codex.required` | boolean | `false` | Require a Codex review of the head even on a PR where Codex never posted. |
+| `codex.idle_wait_minutes` | integer | `10` | Without `codex.required`: how long to wait after the checks finish for Codex to start a review of the head. After that, the missing review no longer blocks readiness, and `codex_gate.idle_wait_expired` says so. |
 | `pr_af.enabled` | boolean | `false` | Watch the label-triggered PR-AF review. When `false`, the watcher makes no PR-AF calls. |
 | `pr_af.label` | string | `"pr-af"` | The PR label that asks for a PR-AF review. |
 | `pr_af.workflow_names` | list of strings | `[]` | Names of the PR-AF workflow. |
