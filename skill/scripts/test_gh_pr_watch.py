@@ -1417,8 +1417,12 @@ class UpToDateRequirementTests(unittest.TestCase):
         self.addCleanup(watch._UP_TO_DATE_CACHE.clear)
 
     @staticmethod
-    def _http_error(code):
-        return watch.GhCommandError(f"GitHub CLI command failed: gh api x\nstderr: gh: Not Found (HTTP {code})")
+    def _http_error(code, message="Not Found"):
+        return watch.GhCommandError(
+            f"GitHub CLI command failed: gh api x\n"
+            f'stdout: {{"message":"{message}","status":"{code}"}}\n'
+            f"stderr: gh: {message} (HTTP {code})"
+        )
 
     def _lookup(self, protection, rules, config=None):
         """Run the auto lookup with fake protection and ruleset answers (a value or an error)."""
@@ -1467,12 +1471,40 @@ class UpToDateRequirementTests(unittest.TestCase):
         result, _, _ = self._lookup(self._http_error(404), rules)
         self.assertTrue(result)
 
-    def test_404_and_403_mean_not_required(self):
-        for code in (403, 404):
-            with self.subTest(code=code):
+    def test_an_unprotected_branch_without_rulesets_is_not_required(self):
+        for message in ("Branch not protected", "Required status checks not enabled"):
+            with self.subTest(message=message):
                 watch._UP_TO_DATE_CACHE.clear()
-                result, _, _ = self._lookup(self._http_error(code), self._http_error(code))
+                result, _, _ = self._lookup(self._http_error(404, message), [])
                 self.assertFalse(result)
+
+    def test_403_is_unknown_and_fails_closed(self):
+        # The protection endpoint needs admin access, so a collaborator token gets 403
+        # even when strict checks are required. The rulesets list can still be empty,
+        # because legacy branch protection is separate from rulesets.
+        for message in ("Resource not accessible by integration",
+                        "Upgrade to GitHub Pro or make this repository public to enable this feature."):
+            with self.subTest(message=message):
+                watch._UP_TO_DATE_CACHE.clear()
+                result, _, _ = self._lookup(self._http_error(403, message), [])
+                self.assertTrue(result)
+
+    def test_a_404_without_a_known_message_is_unknown_and_fails_closed(self):
+        result, _, _ = self._lookup(self._http_error(404, "Not Found"), [])
+        self.assertTrue(result)
+
+    def test_a_failed_ruleset_lookup_is_unknown_and_fails_closed(self):
+        for rules_error in (self._http_error(403, "Forbidden"), self._http_error(404, "Not Found")):
+            with self.subTest(rules_error=str(rules_error)):
+                watch._UP_TO_DATE_CACHE.clear()
+                result, _, _ = self._lookup({"strict": False}, rules_error)
+                self.assertTrue(result)
+
+    def test_an_unknown_answer_is_not_cached(self):
+        self._lookup(self._http_error(403, "Forbidden"), [])
+        result, json_calls, _ = self._lookup({"strict": False}, [])
+        self.assertFalse(result)
+        json_calls.assert_called_once()
 
     def test_other_lookup_failures_fail_closed(self):
         result, _, _ = self._lookup(watch.GhCommandError("GitHub CLI command timed out: gh api x"), [])

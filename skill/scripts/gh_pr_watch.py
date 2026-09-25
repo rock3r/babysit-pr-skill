@@ -1863,31 +1863,39 @@ def merge_state_blocks_readiness(pr):
     return state in MERGE_CONFLICT_OR_BLOCKING_STATES
 
 
-def _is_not_found_or_forbidden(err):
-    return re.search(r"HTTP 40[34]\b", str(err)) is not None
+# 404 answers of the protection endpoint that say for sure that no strict requirement
+# exists. Any other 404 (for example a plain "Not Found") and every 403 prove nothing.
+_NO_PROTECTION_MESSAGES = ("Branch not protected", "Required status checks not enabled")
+
+
+def _is_definitive_no_protection(err):
+    text = str(err)
+    return "HTTP 404" in text and any(message in text for message in _NO_PROTECTION_MESSAGES)
 
 
 def branch_protection_requires_up_to_date(repo, branch):
+    """True or False from branch protection. Raises GhCommandError when it cannot tell.
+
+    The endpoint needs repository administration access, so a collaborator token gets a
+    403 even when strict checks are required. A 403, including the "Upgrade to GitHub Pro"
+    answer on free private repositories, is therefore unknown, not "not required".
+    """
     endpoint = f"repos/{repo}/branches/{quote(branch, safe='')}/protection/required_status_checks"
     try:
         data = gh_json(["api", endpoint])
     except GhCommandError as err:
-        # 404: no protection or no required checks. 403: the token cannot read the
-        # protection settings. Neither shows a strict requirement.
-        if _is_not_found_or_forbidden(err):
+        if _is_definitive_no_protection(err):
             return False
         raise
-    return isinstance(data, dict) and data.get("strict") is True
+    if not isinstance(data, dict) or not isinstance(data.get("strict"), bool):
+        raise GhCommandError(f"Unexpected payload from gh api {endpoint}")
+    return data["strict"]
 
 
 def rulesets_require_up_to_date(repo, branch):
+    """True or False from the rulesets. Raises GhCommandError when it cannot tell."""
     endpoint = f"repos/{repo}/rules/branches/{quote(branch, safe='')}"
-    try:
-        rules = gh_api_list_paginated(endpoint)
-    except GhCommandError as err:
-        if _is_not_found_or_forbidden(err):
-            return False
-        raise
+    rules = gh_api_list_paginated(endpoint)
     for rule in rules or []:
         if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
             continue
@@ -1901,8 +1909,11 @@ def base_requires_up_to_date(repo, branch):
     """Whether the base branch requires a PR to be up to date before it can merge.
 
     The config can answer directly with true or false. With "auto" the watcher reads the
-    branch protection and the rulesets once per run. A failed lookup other than 403 or
-    404 counts as "required", so the watcher never reports an unmergeable PR as ready.
+    branch protection and the rulesets. Only definitive answers say "not required": a
+    404 that says the branch has no protection or no required checks, or a successful
+    answer with strict set to false, and in both cases rulesets without a strict rule.
+    Anything else, such as a 403 or a failed call, counts as "required", so the watcher
+    never reports an unmergeable PR as ready. Only definitive answers are cached.
     """
     setting = CONFIG["require_up_to_date"]
     if setting is True or setting is False:
@@ -1913,8 +1924,8 @@ def base_requires_up_to_date(repo, branch):
     if key not in _UP_TO_DATE_CACHE:
         try:
             _UP_TO_DATE_CACHE[key] = (
-                branch_protection_requires_up_to_date(repo, branch)
-                or rulesets_require_up_to_date(repo, branch)
+                rulesets_require_up_to_date(repo, branch)
+                or branch_protection_requires_up_to_date(repo, branch)
             )
         except GhCommandError:
             return True
