@@ -1244,28 +1244,28 @@ class CodexHeadReviewTests(unittest.TestCase):
 
     def test_no_summary_comment_means_codex_is_not_active_on_the_pr(self):
         review = watch.summarize_codex_head_review([], self.HEAD)
-        self.assertEqual(review, {"active": False, "head_reviewed": False})
+        self.assertEqual(review, {"active": False, "head_reviewed": False, "head_status": "none"})
 
     def test_completed_review_of_the_current_head_counts(self):
         comments = [self._summary("✅ **Completed**", self.HEAD[:7])]
         review = watch.summarize_codex_head_review(comments, self.HEAD)
-        self.assertEqual(review, {"active": True, "head_reviewed": True})
+        self.assertEqual(review, {"active": True, "head_reviewed": True, "head_status": "completed"})
 
     def test_running_review_of_the_current_head_does_not_count(self):
         comments = [self._summary("🔄 **Running** since", self.HEAD[:7])]
         review = watch.summarize_codex_head_review(comments, self.HEAD)
-        self.assertEqual(review, {"active": True, "head_reviewed": False})
+        self.assertEqual(review, {"active": True, "head_reviewed": False, "head_status": "running"})
 
     def test_completed_review_of_an_older_head_does_not_count(self):
         comments = [self._summary("✅ **Completed**", "734f214")]
         review = watch.summarize_codex_head_review(comments, self.HEAD)
-        self.assertEqual(review, {"active": True, "head_reviewed": False})
+        self.assertEqual(review, {"active": True, "head_reviewed": False, "head_status": "none"})
 
     def test_summary_from_a_non_codex_author_is_ignored(self):
         comment = self._summary("✅ **Completed**", self.HEAD[:7])
         comment["user"] = {"login": "someone-else"}
         review = watch.summarize_codex_head_review([comment], self.HEAD)
-        self.assertEqual(review, {"active": False, "head_reviewed": False})
+        self.assertEqual(review, {"active": False, "head_reviewed": False, "head_status": "none"})
 
     def _ready(self, codex_gate):
         pr = {
@@ -1545,6 +1545,83 @@ class SessionTimeoutTests(unittest.TestCase):
         self.assertEqual(payload["actions"], ["diagnose_branch_behind", "wait_codex", "stop_session_timeout"])
         self.assertEqual(payload["snapshot"]["actions"], payload["actions"])
         self.assertEqual(payload["state_file"], "/tmp/s.json")
+
+
+class CodexSettingsTests(unittest.TestCase):
+    HEAD = "b5d394b666fc83b4fa9f779dc85512544662ef0a"
+
+    def _summary(self, status, sha=None):
+        return {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "<!-- codex-pull-request-review-summary -->\n"
+                f"| 📝 **Code Review** | {status} | `{sha or self.HEAD[:7]}` | New commits |\n"
+            ),
+        }
+
+    def test_failed_review_of_the_head_is_diagnosed_instead_of_awaited(self):
+        for status in ("❌ **Failed**", "**Cancelled**", "unexpected status"):
+            with self.subTest(status=status):
+                review = watch.summarize_codex_head_review([self._summary(status)], self.HEAD)
+                self.assertEqual(review["head_status"], "failed")
+                gate = {"reviewing": False, "status": "idle"}
+                gate.update(review)
+                actions = _actions_for(_open_pr(), codex_gate=gate)
+                self.assertEqual(actions, ["diagnose_codex_review"])
+                self.assertTrue(watch.needs_agent_attention(actions))
+
+    def test_a_completed_row_wins_over_a_failed_row_for_the_same_head(self):
+        comments = [self._summary("❌ **Failed**"), self._summary("✅ **Completed**")]
+        review = watch.summarize_codex_head_review(comments, self.HEAD)
+        self.assertTrue(review["head_reviewed"])
+        self.assertEqual(review["head_status"], "completed")
+
+    def test_disabled_codex_makes_no_codex_calls_and_does_not_gate(self):
+        pr = {
+            "repo": "owner/repo", "number": 21, "head_sha": "abc123",
+            "closed": False, "merged": False, "mergeable": "MERGEABLE",
+            "merge_state_status": "CLEAN", "review_decision": "",
+        }
+        args = SimpleNamespace(pr="21", repo=None, state_file=None, max_flaky_retries=3)
+        checks = [{"name": "build", "bucket": "pass", "state": "SUCCESS"}]
+        with tempfile.TemporaryDirectory() as tmp, configured({"codex": {"enabled": False}}), \
+                patch.object(watch, "resolve_pr", return_value=pr), \
+                patch.object(watch, "default_state_file_for", return_value=watch.Path(tmp) / "s.json"), \
+                patch.object(watch, "get_pr_checks", return_value=checks), \
+                patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                patch.object(watch, "collect_codex_gate") as codex_lookup, \
+                patch.object(watch, "fetch_new_review_items", return_value=([], [])):
+            snapshot, _ = watch.collect_snapshot(args)
+
+        codex_lookup.assert_not_called()
+        self.assertIsNone(snapshot["codex_gate"])
+
+    def test_required_codex_that_never_showed_up_is_requested_once_checks_finish(self):
+        absent = {"reviewing": False, "status": "idle", "active": False, "head_reviewed": False,
+                  "head_status": "none"}
+        with configured({"codex": {"required": True}}):
+            self.assertEqual(
+                _actions_for(_open_pr(), _green_checks(all_terminal=False, pending_count=1),
+                             checks_terminal_elapsed=None, codex_gate=absent),
+                ["wait_codex"],
+            )
+            self.assertEqual(_actions_for(_open_pr(), checks_terminal_elapsed=10, codex_gate=absent),
+                             ["wait_codex"])
+            actions = _actions_for(_open_pr(), codex_gate=absent)
+        self.assertEqual(actions, ["request_codex_review"])
+        self.assertTrue(watch.needs_agent_attention(actions))
+
+    def test_optional_codex_that_never_showed_up_does_not_block(self):
+        absent = {"reviewing": False, "status": "idle", "active": False, "head_reviewed": False,
+                  "head_status": "none"}
+        with configured():
+            self.assertEqual(_actions_for(_open_pr(), codex_gate=absent), ["stop_ready_to_merge"])
+
+    def test_required_codex_with_a_review_of_the_head_is_ready(self):
+        reviewed = {"reviewing": False, "status": "idle", "active": True, "head_reviewed": True,
+                    "head_status": "completed"}
+        with configured({"codex": {"required": True}}):
+            self.assertEqual(_actions_for(_open_pr(), codex_gate=reviewed), ["stop_ready_to_merge"])
 
 
 class SnapshotOrderingTests(unittest.TestCase):

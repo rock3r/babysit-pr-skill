@@ -808,7 +808,7 @@ def summarize_codex_head_review(issue_comments, head_sha):
     no such comment, Codex is not active on it and this check does not apply.
     """
     active = False
-    head_reviewed = False
+    head_statuses = set()
     for comment in issue_comments or []:
         if not isinstance(comment, dict):
             continue
@@ -819,9 +819,35 @@ def summarize_codex_head_review(issue_comments, head_sha):
             continue
         active = True
         for row in _CODEX_SUMMARY_ROW.finditer(body):
-            if "Completed" in row.group("status") and str(head_sha or "").startswith(row.group("sha")):
-                head_reviewed = True
-    return {"active": active, "head_reviewed": head_reviewed}
+            if str(head_sha or "").startswith(row.group("sha")):
+                head_statuses.add(classify_codex_review_status(row.group("status")))
+    if "completed" in head_statuses:
+        head_status = "completed"
+    elif "running" in head_statuses:
+        head_status = "running"
+    elif "failed" in head_statuses:
+        head_status = "failed"
+    else:
+        head_status = "none"
+    return {"active": active, "head_reviewed": head_status == "completed", "head_status": head_status}
+
+
+# Words in the status column of Codex's summary table that mean "still working".
+_CODEX_IN_PROGRESS_WORDS = ("running", "queued", "pending", "in progress", "started")
+
+
+def classify_codex_review_status(status_text):
+    """Map one status cell of the Codex summary table to completed, running, or failed.
+
+    Anything else, such as Failed, Cancelled, or a status this watcher does not know,
+    counts as failed. Waiting on it would only end at the session timeout.
+    """
+    lower = str(status_text or "").lower()
+    if "completed" in lower:
+        return "completed"
+    if any(word in lower for word in _CODEX_IN_PROGRESS_WORDS):
+        return "running"
+    return "failed"
 
 
 def collect_codex_gate(pr):
@@ -832,7 +858,7 @@ def collect_codex_gate(pr):
         codex_gate.update(summarize_codex_head_review(issue_comments, pr["head_sha"]))
     except GhCommandError:
         # Without the summary comment we cannot prove the head was reviewed: treat as unknown.
-        codex_gate.update({"status": "unknown", "active": True, "head_reviewed": False})
+        codex_gate.update({"status": "unknown", "active": True, "head_reviewed": False, "head_status": "none"})
     return codex_gate
 
 
@@ -1277,7 +1303,36 @@ def unique_actions(actions):
 
 def codex_waiting_for_head_review(codex_gate):
     """Codex is active on the PR but has not finished a review of the current head yet."""
-    return bool(codex_gate) and bool(codex_gate.get("active")) and not bool(codex_gate.get("head_reviewed"))
+    return (
+        bool(codex_gate)
+        and bool(codex_gate.get("active"))
+        and not bool(codex_gate.get("head_reviewed"))
+        and str(codex_gate.get("head_status") or "") != "failed"
+    )
+
+
+def codex_review_failed(codex_gate):
+    """Codex's summary reports a failed or unknown review status for the current head."""
+    return (
+        bool(codex_gate)
+        and not bool(codex_gate.get("reviewing"))
+        and bool(codex_gate.get("active"))
+        and not bool(codex_gate.get("head_reviewed"))
+        and str(codex_gate.get("head_status") or "") == "failed"
+    )
+
+
+def codex_required():
+    return bool(CONFIG["codex"]["enabled"]) and bool(CONFIG["codex"]["required"])
+
+
+def codex_missing_but_required(codex_gate):
+    """The config requires Codex, but Codex has not shown up on this PR at all."""
+    if not codex_required():
+        return False
+    if not codex_gate:
+        return True
+    return not bool(codex_gate.get("active")) and not bool(codex_gate.get("reviewing"))
 
 
 def is_pr_ready_to_merge(
@@ -1312,7 +1367,9 @@ def is_pr_ready_to_merge(
         return False
     if codex_gate and bool(codex_gate.get("reviewing")):
         return False
-    if codex_waiting_for_head_review(codex_gate):
+    if codex_waiting_for_head_review(codex_gate) or codex_review_failed(codex_gate):
+        return False
+    if codex_required() and not (codex_gate and codex_gate.get("head_reviewed")):
         return False
     # A failed reactions lookup means we cannot tell whether Codex is still reviewing.
     if codex_gate and str(codex_gate.get("status") or "") == "unknown":
@@ -1528,6 +1585,14 @@ def recommend_actions(
 
     if codex_gate and (bool(codex_gate.get("reviewing")) or codex_waiting_for_head_review(codex_gate)):
         actions.append("wait_codex")
+    elif codex_review_failed(codex_gate):
+        actions.append("diagnose_codex_review")
+    elif codex_missing_but_required(codex_gate):
+        # Give Codex until the checks finish to show up on its own, then ask for a review.
+        if checks_summary["all_terminal"] and grace_period_elapsed(checks_terminal_elapsed):
+            actions.append("request_codex_review")
+        else:
+            actions.append("wait_codex")
 
     if hung_checks:
         actions.append("diagnose_hung_check")
@@ -1593,7 +1658,7 @@ def collect_snapshot(args):
         authenticated_login = None
     # Read Codex's state before scanning review comments. Codex posts its findings before it
     # marks the head reviewed, so this order can never pair "reviewed" with a stale scan.
-    codex_gate = collect_codex_gate(pr)
+    codex_gate = collect_codex_gate(pr) if CONFIG["codex"]["enabled"] else None
     new_review_items, blocking_review_items = fetch_new_review_items(
         pr,
         state,
