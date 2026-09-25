@@ -44,6 +44,9 @@ DEFAULT_CONFIG = {
         "enabled": True,
         # Require a Codex review of the head even when Codex never posted on the PR.
         "required": False,
+        # Without `required`: how long to wait, after the checks finish, for Codex to start
+        # a review of the head before the missing review stops blocking readiness.
+        "idle_wait_minutes": 10,
     },
     "pr_af": {
         # Watch the label-triggered PR-AF review workflow.
@@ -118,6 +121,7 @@ CONFIG_VALIDATORS = {
     "codex": {
         "enabled": _check_bool,
         "required": _check_bool,
+        "idle_wait_minutes": _check_non_negative_int,
     },
     "pr_af": {
         "enabled": _check_bool,
@@ -1746,6 +1750,7 @@ def codex_waiting_for_head_review(codex_gate):
     """Codex is active on the PR but has not finished a review of the current head yet."""
     return (
         bool(codex_gate)
+        and not bool(codex_gate.get("idle_wait_expired"))
         and bool(codex_gate.get("active"))
         and not bool(codex_gate.get("head_reviewed"))
         and str(codex_gate.get("head_status") or "") != "failed"
@@ -1765,6 +1770,42 @@ def codex_review_failed(codex_gate):
 
 def codex_required():
     return bool(CONFIG["codex"]["enabled"]) and bool(CONFIG["codex"]["required"])
+
+
+def apply_codex_idle_wait(codex_gate, checks_summary, checks_terminal_elapsed):
+    """Stop waiting for a Codex review of the head that never starts.
+
+    Codex can be active on a PR (its summary table exists) and still never review a new
+    head. Without `codex.required`, the watcher waits `codex.idle_wait_minutes` after the
+    checks finish. When Codex has not started by then (no 👀 reaction, no running or
+    completed row for the head), the missing review stops blocking readiness, and the
+    gate says so in `idle_wait_expired` and `note`. A running review still blocks, an
+    unreadable Codex state still waits, and with `codex.required` the watcher asks for a
+    review instead.
+    """
+    if not codex_gate or codex_required():
+        return codex_gate
+    if (
+        not codex_gate.get("active")
+        or codex_gate.get("reviewing")
+        or codex_gate.get("head_reviewed")
+        or str(codex_gate.get("head_status") or "") != "none"
+        or str(codex_gate.get("status") or "") == "unknown"
+    ):
+        return codex_gate
+    if not checks_summary.get("all_terminal") or checks_terminal_elapsed is None:
+        return codex_gate
+    minutes = int(CONFIG["codex"]["idle_wait_minutes"])
+    limit = max(minutes * 60, CHECKS_TERMINAL_GRACE_PERIOD_SECONDS)
+    if checks_terminal_elapsed < limit:
+        return codex_gate
+    gate = dict(codex_gate)
+    gate["idle_wait_expired"] = True
+    gate["note"] = (
+        f"Codex did not review this head within {minutes} minutes after the checks finished, "
+        "so the missing review no longer blocks readiness."
+    )
+    return gate
 
 
 def codex_review_stale_but_required(codex_gate):
@@ -2274,6 +2315,7 @@ def collect_snapshot(args):
         checks_terminal_elapsed = None
 
 
+    codex_gate = apply_codex_idle_wait(codex_gate, checks_summary, checks_terminal_elapsed)
     retries_used = current_retry_count(state, pr["head_sha"])
     actions = recommend_actions(
         pr,
