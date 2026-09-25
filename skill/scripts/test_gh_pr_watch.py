@@ -1815,6 +1815,42 @@ class CodexSettingsTests(unittest.TestCase):
         self.assertEqual(actions, ["request_codex_review"])
         self.assertTrue(watch.needs_agent_attention(actions))
 
+    STALE = {"reviewing": False, "status": "idle", "active": True, "head_reviewed": False, "head_status": "none"}
+
+    def test_required_codex_with_a_stale_review_is_requested_once_checks_finish(self):
+        # Codex reviewed an older head and is not reviewing now. On a repository where
+        # Codex does not review every push by itself, waiting would only time out.
+        with configured({"codex": {"required": True}}):
+            actions = _actions_for(_open_pr(), codex_gate=self.STALE)
+        self.assertEqual(actions, ["request_codex_review"])
+        self.assertTrue(watch.needs_agent_attention(actions))
+
+    def test_required_codex_with_a_stale_review_waits_while_checks_run_or_in_grace(self):
+        with configured({"codex": {"required": True}}):
+            pending = _actions_for(_open_pr(), _green_checks(all_terminal=False, pending_count=1),
+                                   checks_terminal_elapsed=None, codex_gate=self.STALE)
+            in_grace = _actions_for(_open_pr(), checks_terminal_elapsed=10, codex_gate=self.STALE)
+        self.assertEqual(pending, ["wait_codex"])
+        self.assertEqual(in_grace, ["wait_codex"])
+
+    def test_required_codex_that_is_reviewing_or_running_on_the_head_is_awaited(self):
+        reviewing = dict(self.STALE, reviewing=True, status="in_progress")
+        running = dict(self.STALE, head_status="running")
+        with configured({"codex": {"required": True}}):
+            self.assertEqual(_actions_for(_open_pr(), codex_gate=reviewing), ["wait_codex"])
+            self.assertEqual(_actions_for(_open_pr(), codex_gate=running), ["wait_codex"])
+
+    def test_required_codex_with_an_unreadable_summary_is_not_requested(self):
+        # When the summary comment cannot be read, the watcher does not know whether a
+        # review of the head exists, so it keeps waiting instead of asking for one.
+        unknown = dict(self.STALE, status="unknown")
+        with configured({"codex": {"required": True}}):
+            self.assertEqual(_actions_for(_open_pr(), codex_gate=unknown), ["wait_codex"])
+
+    def test_optional_codex_with_a_stale_review_keeps_waiting(self):
+        with configured():
+            self.assertEqual(_actions_for(_open_pr(), codex_gate=self.STALE), ["wait_codex"])
+
     def test_optional_codex_that_never_showed_up_does_not_block(self):
         absent = {"reviewing": False, "status": "idle", "active": False, "head_reviewed": False,
                   "head_status": "none"}

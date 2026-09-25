@@ -1759,6 +1759,23 @@ def codex_required():
     return bool(CONFIG["codex"]["enabled"]) and bool(CONFIG["codex"]["required"])
 
 
+def codex_review_stale_but_required(codex_gate):
+    """The config requires Codex, and its latest review is of another commit.
+
+    Codex is active on the PR, is not reviewing now, and has no row at all for the head
+    in its summary table.
+    """
+    return (
+        codex_required()
+        and bool(codex_gate)
+        and bool(codex_gate.get("active"))
+        and not bool(codex_gate.get("reviewing"))
+        and not bool(codex_gate.get("head_reviewed"))
+        and str(codex_gate.get("head_status") or "") == "none"
+        and str(codex_gate.get("status") or "") != "unknown"
+    )
+
+
 def codex_missing_but_required(codex_gate):
     """The config requires Codex, but Codex has not shown up on this PR at all."""
     if not codex_required():
@@ -2113,7 +2130,13 @@ def recommend_actions(
     elif blocking_review_items:
         actions.append("process_review_comment")
 
-    if codex_gate and (bool(codex_gate.get("reviewing")) or codex_waiting_for_head_review(codex_gate)):
+    if codex_review_stale_but_required(codex_gate) and checks_summary["all_terminal"] and grace_period_elapsed(
+        checks_terminal_elapsed
+    ):
+        # Codex reviewed an older head and is idle. Where Codex does not review every push
+        # by itself, only a request brings a review of this head.
+        actions.append("request_codex_review")
+    elif codex_gate and (bool(codex_gate.get("reviewing")) or codex_waiting_for_head_review(codex_gate)):
         actions.append("wait_codex")
     elif codex_review_failed(codex_gate):
         actions.append("diagnose_codex_review")
