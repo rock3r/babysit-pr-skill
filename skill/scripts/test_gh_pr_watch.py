@@ -1624,6 +1624,54 @@ class CodexSettingsTests(unittest.TestCase):
             self.assertEqual(_actions_for(_open_pr(), codex_gate=reviewed), ["stop_ready_to_merge"])
 
 
+class ReviewListFallbackTests(unittest.TestCase):
+    def test_falls_back_to_graphql_when_the_rest_review_list_fails(self):
+        graphql_reviews = [{
+            "id": 123, "user": {"login": "maintainer"}, "author_association": "MEMBER",
+            "submitted_at": "2026-08-17T14:00:00Z", "body": "Please rename this", "state": "COMMENTED",
+            "html_url": "https://example.invalid/review/123",
+        }]
+        with patch.object(watch, "gh_api_list_paginated", side_effect=watch.GhCommandError("REST failed")), \
+                patch.object(watch, "gh_graphql_list_reviews", return_value=graphql_reviews) as graphql_fetch:
+            payload = watch.get_review_payload("owner/repo", 27)
+
+        self.assertEqual(payload, graphql_reviews)
+        graphql_fetch.assert_called_once_with("owner/repo", 27)
+
+    def test_graphql_bot_author_gets_the_rest_login_shape(self):
+        payload = {"data": {"repository": {"pullRequest": {"reviews": {
+            "nodes": [{
+                "id": 123, "user": {"login": "chatgpt-codex-connector", "type": "Bot"},
+                "author_association": "NONE", "submitted_at": "2026-08-17T14:00:00Z",
+                "body": "Found an issue", "state": "COMMENTED", "html_url": "https://example.invalid/r",
+            }],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}}}
+        with patch.object(watch, "gh_json", return_value=payload):
+            reviews = watch.gh_graphql_list_reviews("owner/repo", 27)
+
+        self.assertEqual(reviews[0]["user"]["login"], "chatgpt-codex-connector[bot]")
+
+    def test_graphql_review_errors_fail_closed(self):
+        with patch.object(watch, "gh_json", return_value={"data": None, "errors": [{"message": "down"}]}):
+            with self.assertRaises(watch.GhCommandError):
+                watch.gh_graphql_list_reviews("owner/repo", 27)
+
+    def test_review_items_survive_a_failed_rest_review_list(self):
+        pr = {"repo": "owner/repo", "number": 27, "head_sha": "abc123"}
+        state = {"seen_issue_comment_ids": [], "seen_review_comment_ids": [], "seen_review_ids": [],
+                 "last_review_poll_at": None}
+        review = {"id": 5, "user": {"login": "maintainer"}, "author_association": "MEMBER",
+                  "submitted_at": "2026-08-17T14:00:00Z", "body": "Please rename this",
+                  "state": "CHANGES_REQUESTED", "html_url": "https://example.invalid/review/5"}
+        with patch.object(watch, "gh_api_list_paginated",
+                          side_effect=[[], [], watch.GhCommandError("REST failed")]), \
+                patch.object(watch, "gh_graphql_list_reviews", return_value=[review]):
+            new_items, _ = watch.fetch_new_review_items(pr, state, fresh_state=True, authenticated_login="octocat")
+
+        self.assertEqual([item["id"] for item in new_items], ["5"])
+
+
 class SnapshotOrderingTests(unittest.TestCase):
     def test_codex_gate_is_read_before_review_comments(self):
         # If Codex posts a finding and then marks the head reviewed between the two reads,
