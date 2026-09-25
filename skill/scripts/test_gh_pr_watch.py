@@ -1474,12 +1474,31 @@ class RequiredChecksTests(unittest.TestCase):
         actions = _actions_for(_open_pr(merge_state_status="BLOCKED"), _green_checks(passed_count=0))
         self.assertEqual(actions, ["idle"])
 
-    def test_summary_counts_every_check_that_gh_reported(self):
+    def test_check_count_ignores_expected_skips_and_advisory_checks(self):
+        # check_count must agree with the pass, pending, and fail totals. A check that
+        # those totals ignore cannot make a PR ready, so it must not hide "no checks".
         self.assertEqual(watch.summarize_checks([])["check_count"], 0)
-        checks = [{"name": "build", "bucket": "pass", "state": "SUCCESS"},
-                  {"name": "deploy", "bucket": "skipping", "state": "SKIPPED"}]
-        with configured({"expected_skipped_checks": ["deploy"]}):
-            self.assertEqual(watch.summarize_checks(checks)["check_count"], 2)
+        checks = [
+            {"name": "build", "bucket": "pass", "state": "SUCCESS"},
+            {"name": "deploy", "bucket": "skipping", "state": "SKIPPED"},
+            {"name": "pr-af-review", "workflow": "PR-AF Review", "bucket": "pass", "state": "SUCCESS"},
+        ]
+        with configured(dict(PR_AF_CONFIG, expected_skipped_checks=["deploy"])):
+            self.assertEqual(watch.summarize_checks(checks)["check_count"], 1)
+
+    def test_only_ignored_checks_count_as_no_checks(self):
+        checks = [
+            {"name": "deploy", "bucket": "skipping", "state": "SKIPPED"},
+            {"name": "pr-af-review", "workflow": "PR-AF Review", "bucket": "fail", "state": "FAILURE"},
+        ]
+        with configured(dict(PR_AF_CONFIG, expected_skipped_checks=["deploy"])):
+            summary = watch.summarize_checks(checks)
+        self.assertEqual(summary["check_count"], 0)
+        self.assertEqual(_actions_for(_open_pr(), summary), ["diagnose_no_checks"])
+
+    def test_an_unexpected_skip_still_counts_as_a_check(self):
+        summary = watch.summarize_checks([{"name": "lint", "bucket": "skipping", "state": "SKIPPED"}])
+        self.assertEqual(summary["check_count"], 1)
 
     def test_pr_without_checks_waits_during_the_grace_period(self):
         actions = _actions_for(_open_pr(), _green_checks(passed_count=0, check_count=0),

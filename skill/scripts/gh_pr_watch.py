@@ -648,6 +648,7 @@ def summarize_checks(checks):
     failed_count = 0
     passed_count = 0
     skipping_count = 0
+    check_count = 0
     for check in checks:
         # PR-AF is advisory: its own gate reports it, and its result is never a CI failure.
         if is_optional_review_check(check):
@@ -666,6 +667,7 @@ def summarize_checks(checks):
             if bucket == "skipping" and is_expected_skipped_check(check):
                 continue
             skipping_count += 1
+        check_count += 1
     return {
         "pending_count": pending_count,
         "failed_count": failed_count,
@@ -673,8 +675,9 @@ def summarize_checks(checks):
         "skipping_count": skipping_count,
         "all_terminal": pending_count == 0,
         "required_missing": missing_required_checks(checks),
-        # Every check gh reported, including expected skips and advisory checks.
-        "check_count": len(checks),
+        # The checks that these totals judge. Advisory checks and expected skips are left
+        # out: they can never make a PR ready, so they must not hide "no checks".
+        "check_count": check_count,
     }
 
 
