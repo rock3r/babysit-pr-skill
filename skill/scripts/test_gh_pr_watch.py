@@ -39,6 +39,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["trusted_author_associations"], ["OWNER", "MEMBER", "COLLABORATOR"])
         self.assertEqual(config["review_bot_login_keywords"], ["codex"])
         self.assertEqual(config["max_session_minutes"], 90)
+        self.assertEqual(config["require_up_to_date"], "auto")
         self.assertTrue(config["codex"]["enabled"])
         self.assertFalse(config["codex"]["required"])
         self.assertNotIn("coderabbit", config)
@@ -92,6 +93,8 @@ class ConfigTests(unittest.TestCase):
             {"pr_af": {"missing_check_grace_minutes": -1}},
             {"cleanup": {"branch_delete_requires_approval": 1}},
             {"version": "1"},
+            {"require_up_to_date": "yes"},
+            {"require_up_to_date": 1},
         ]
         for raw in bad_values:
             with self.subTest(raw=raw):
@@ -1396,6 +1399,127 @@ class BranchBehindTests(unittest.TestCase):
         self.assertIn("diagnose_branch_behind", actions)
         self.assertNotIn("stop_ready_to_merge", actions)
         self.assertTrue(watch.should_stop_watching(actions))
+
+
+class UpToDateRequirementTests(unittest.TestCase):
+    """BEHIND only means "the head is out of date". It blocks the merge only when the
+    base branch requires up-to-date branches (strict status checks)."""
+
+    def setUp(self):
+        watch._UP_TO_DATE_CACHE.clear()
+        self.addCleanup(watch._UP_TO_DATE_CACHE.clear)
+
+    @staticmethod
+    def _http_error(code):
+        return watch.GhCommandError(f"GitHub CLI command failed: gh api x\nstderr: gh: Not Found (HTTP {code})")
+
+    def _lookup(self, protection, rules, config=None):
+        """Run the auto lookup with fake protection and ruleset answers (a value or an error)."""
+        def fake_json(args, **_kwargs):
+            if isinstance(protection, Exception):
+                raise protection
+            return protection
+
+        def fake_list(endpoint, **_kwargs):
+            if isinstance(rules, Exception):
+                raise rules
+            return rules
+
+        with configured(config or {}), \
+                patch.object(watch, "gh_json", side_effect=fake_json) as json_calls, \
+                patch.object(watch, "gh_api_list_paginated", side_effect=fake_list) as list_calls:
+            result = watch.base_requires_up_to_date("owner/repo", "main")
+        return result, json_calls, list_calls
+
+    def test_behind_branch_is_ready_when_the_base_does_not_require_up_to_date(self):
+        pr = _open_pr(merge_state_status="BEHIND", up_to_date_required=False)
+        self.assertTrue(watch.is_pr_ready_to_merge(
+            pr, _green_checks(), new_review_items=[], checks_terminal_elapsed=120, blocking_review_items=[]))
+        self.assertEqual(_actions_for(pr), ["stop_ready_to_merge"])
+
+    def test_behind_branch_waits_on_codex_without_a_branch_update_when_not_required(self):
+        pr = _open_pr(merge_state_status="BEHIND", up_to_date_required=False)
+        gate = {"reviewing": True, "status": "in_progress", "active": True, "head_reviewed": False}
+        self.assertEqual(_actions_for(pr, codex_gate=gate), ["wait_codex"])
+
+    def test_behind_branch_still_asks_for_an_update_when_required(self):
+        pr = _open_pr(merge_state_status="BEHIND", up_to_date_required=True)
+        self.assertIn("diagnose_branch_behind", _actions_for(pr))
+
+    def test_strict_branch_protection_requires_up_to_date(self):
+        result, _, _ = self._lookup({"strict": True, "contexts": ["check"]}, [])
+        self.assertTrue(result)
+
+    def test_loose_protection_and_no_rules_do_not_require_up_to_date(self):
+        result, _, _ = self._lookup({"strict": False, "contexts": ["check"]}, [])
+        self.assertFalse(result)
+
+    def test_a_strict_ruleset_requires_up_to_date(self):
+        rules = [{"type": "required_status_checks",
+                  "parameters": {"strict_required_status_checks_policy": True, "required_status_checks": []}}]
+        result, _, _ = self._lookup(self._http_error(404), rules)
+        self.assertTrue(result)
+
+    def test_404_and_403_mean_not_required(self):
+        for code in (403, 404):
+            with self.subTest(code=code):
+                watch._UP_TO_DATE_CACHE.clear()
+                result, _, _ = self._lookup(self._http_error(code), self._http_error(code))
+                self.assertFalse(result)
+
+    def test_other_lookup_failures_fail_closed(self):
+        result, _, _ = self._lookup(watch.GhCommandError("GitHub CLI command timed out: gh api x"), [])
+        self.assertTrue(result)
+
+    def test_config_override_skips_the_lookup(self):
+        for setting in (True, False):
+            with self.subTest(setting=setting):
+                result, json_calls, list_calls = self._lookup(
+                    {"strict": not setting}, [], config={"require_up_to_date": setting})
+                self.assertEqual(result, setting)
+                json_calls.assert_not_called()
+                list_calls.assert_not_called()
+
+    def test_the_answer_is_cached_per_repository_and_branch(self):
+        self._lookup({"strict": True}, [])
+        result, json_calls, list_calls = self._lookup({"strict": False}, [])
+        self.assertTrue(result)
+        json_calls.assert_not_called()
+        list_calls.assert_not_called()
+
+    def test_resolve_pr_reads_the_base_branch(self):
+        data = {"number": 21, "url": "https://github.com/owner/repo/pull/21", "state": "OPEN",
+                "headRefOid": "abc123", "headRefName": "feature", "baseRefName": "release/2.x",
+                "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "reviewDecision": "", "labels": []}
+        with patch.object(watch, "gh_json", return_value=data) as fake:
+            pr = watch.resolve_pr("21")
+        self.assertIn("baseRefName", fake.call_args[0][0][-1])
+        self.assertEqual(pr["base_branch"], "release/2.x")
+
+    def _snapshot(self, merge_state_status):
+        pr = {"repo": "owner/repo", "number": 21, "head_sha": "abc123", "labels": [], "base_branch": "main",
+              "closed": False, "merged": False, "mergeable": "MERGEABLE",
+              "merge_state_status": merge_state_status, "review_decision": ""}
+        args = SimpleNamespace(pr="21", repo=None, state_file=None, max_flaky_retries=3)
+        with tempfile.TemporaryDirectory() as tmp, configured(), \
+                patch.object(watch, "resolve_pr", return_value=pr), \
+                patch.object(watch, "default_state_file_for", return_value=watch.Path(tmp) / "s.json"), \
+                patch.object(watch, "get_pr_checks", return_value=[_ci_pass()]), \
+                patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                patch.object(watch, "collect_codex_gate", return_value=None), \
+                patch.object(watch, "fetch_new_review_items", return_value=([], [])), \
+                patch.object(watch, "base_requires_up_to_date", return_value=False) as lookup:
+            snapshot, _ = watch.collect_snapshot(args)
+        return snapshot, lookup
+
+    def test_snapshot_looks_up_the_requirement_only_for_a_behind_branch(self):
+        snapshot, lookup = self._snapshot("BEHIND")
+        lookup.assert_called_once_with("owner/repo", "main")
+        self.assertFalse(snapshot["pr"]["up_to_date_required"])
+        self.assertNotIn("diagnose_branch_behind", snapshot["actions"])
+
+        snapshot, lookup = self._snapshot("CLEAN")
+        lookup.assert_not_called()
 
 
 class WaitForBotsBeforeBranchUpdateTests(unittest.TestCase):

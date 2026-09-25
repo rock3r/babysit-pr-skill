@@ -12,7 +12,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 # Project settings live in `config.json` next to the `scripts/` directory. A missing
 # file or a missing key means "use the default". The defaults match a repository with
@@ -36,6 +36,9 @@ DEFAULT_CONFIG = {
     "review_bot_login_keywords": ["codex"],
     # Default for --max-session-minutes.
     "max_session_minutes": 90,
+    # Whether a PR that is behind its base must be updated before merge: "auto" reads the
+    # base branch's protection and rulesets, true or false skips that lookup.
+    "require_up_to_date": "auto",
     "codex": {
         # Watch the Codex review bot (its 👀 reaction and its review summary).
         "enabled": True,
@@ -87,6 +90,10 @@ def _check_optional_string(value):
     return value is None or (isinstance(value, str) and bool(value.strip())), "a non-empty string or null"
 
 
+def _check_up_to_date_setting(value):
+    return value is True or value is False or value == "auto", 'true, false, or "auto"'
+
+
 def _check_string_list(value):
     ok = isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
     return ok, "a list of non-empty strings"
@@ -102,6 +109,7 @@ CONFIG_VALIDATORS = {
     "trusted_author_associations": _check_string_list,
     "review_bot_login_keywords": _check_string_list,
     "max_session_minutes": _check_positive_int,
+    "require_up_to_date": _check_up_to_date_setting,
     "codex": {
         "enabled": _check_bool,
         "required": _check_bool,
@@ -257,6 +265,8 @@ CODEX_BOT_LOGINS = {
 STATE_STALENESS_RESET_SECONDS = 2 * 60 * 60
 
 _AUTHENTICATED_LOGIN_CACHE = None
+# (repo, base branch) -> whether the base requires up-to-date branches.
+_UP_TO_DATE_CACHE = {}
 
 
 class GhCommandError(RuntimeError):
@@ -416,7 +426,7 @@ def parse_pr_spec(pr_spec):
 def pr_view_fields():
     return (
         "number,url,state,mergedAt,closedAt,headRefName,headRefOid,"
-        "headRepository,headRepositoryOwner,mergeable,mergeStateStatus,reviewDecision,labels"
+        "headRepository,headRepositoryOwner,baseRefName,mergeable,mergeStateStatus,reviewDecision,labels"
     )
 
 
@@ -453,6 +463,7 @@ def resolve_pr(pr_spec, repo_override=None):
         "repo": repo,
         "head_sha": str(data.get("headRefOid") or ""),
         "head_branch": str(data.get("headRefName") or ""),
+        "base_branch": str(data.get("baseRefName") or ""),
         "state": state,
         "merged": merged,
         "closed": closed,
@@ -1784,7 +1795,7 @@ def is_pr_ready_to_merge(
         return False
     if str(pr.get("mergeable") or "") != "MERGEABLE":
         return False
-    if str(pr.get("merge_state_status") or "") in MERGE_CONFLICT_OR_BLOCKING_STATES:
+    if merge_state_blocks_readiness(pr):
         return False
     if str(pr.get("review_decision") or "") in MERGE_BLOCKING_REVIEW_DECISIONS:
         return False
@@ -1809,7 +1820,80 @@ def is_pr_ready_to_merge(
 
 
 def is_branch_behind(pr):
-    return str(pr.get("merge_state_status") or "") in MERGE_BEHIND_STATES
+    """The branch is behind its base and the base requires it to be up to date.
+
+    GitHub reports BEHIND for any out-of-date head. It blocks the merge only when the
+    base branch requires strict (up-to-date) status checks. Without the lookup result
+    the watcher assumes it does.
+    """
+    if str(pr.get("merge_state_status") or "") not in MERGE_BEHIND_STATES:
+        return False
+    return pr.get("up_to_date_required", True) is not False
+
+
+def merge_state_blocks_readiness(pr):
+    state = str(pr.get("merge_state_status") or "")
+    if state in MERGE_BEHIND_STATES:
+        return is_branch_behind(pr)
+    return state in MERGE_CONFLICT_OR_BLOCKING_STATES
+
+
+def _is_not_found_or_forbidden(err):
+    return re.search(r"HTTP 40[34]\b", str(err)) is not None
+
+
+def branch_protection_requires_up_to_date(repo, branch):
+    endpoint = f"repos/{repo}/branches/{quote(branch, safe='')}/protection/required_status_checks"
+    try:
+        data = gh_json(["api", endpoint])
+    except GhCommandError as err:
+        # 404: no protection or no required checks. 403: the token cannot read the
+        # protection settings. Neither shows a strict requirement.
+        if _is_not_found_or_forbidden(err):
+            return False
+        raise
+    return isinstance(data, dict) and data.get("strict") is True
+
+
+def rulesets_require_up_to_date(repo, branch):
+    endpoint = f"repos/{repo}/rules/branches/{quote(branch, safe='')}"
+    try:
+        rules = gh_api_list_paginated(endpoint)
+    except GhCommandError as err:
+        if _is_not_found_or_forbidden(err):
+            return False
+        raise
+    for rule in rules or []:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        parameters = rule.get("parameters") or {}
+        if parameters.get("strict_required_status_checks_policy") is True:
+            return True
+    return False
+
+
+def base_requires_up_to_date(repo, branch):
+    """Whether the base branch requires a PR to be up to date before it can merge.
+
+    The config can answer directly with true or false. With "auto" the watcher reads the
+    branch protection and the rulesets once per run. A failed lookup other than 403 or
+    404 counts as "required", so the watcher never reports an unmergeable PR as ready.
+    """
+    setting = CONFIG["require_up_to_date"]
+    if setting is True or setting is False:
+        return setting
+    if not branch:
+        return True
+    key = (repo, branch)
+    if key not in _UP_TO_DATE_CACHE:
+        try:
+            _UP_TO_DATE_CACHE[key] = (
+                branch_protection_requires_up_to_date(repo, branch)
+                or rulesets_require_up_to_date(repo, branch)
+            )
+        except GhCommandError:
+            return True
+    return _UP_TO_DATE_CACHE[key]
 
 
 def is_merge_blocked_without_reason(pr, checks_summary, checks_terminal_elapsed):
@@ -2089,6 +2173,8 @@ def collect_snapshot(args):
 
     now = int(time.time())
     reset_state_for_new_head_sha(state, pr["head_sha"])
+    if str(pr.get("merge_state_status") or "") in MERGE_BEHIND_STATES:
+        pr["up_to_date_required"] = base_requires_up_to_date(pr["repo"], pr.get("base_branch") or "")
 
     # `gh pr checks -R <repo>` requires an explicit PR/branch/url argument.
     # After resolving `--pr auto`, reuse the concrete PR number.

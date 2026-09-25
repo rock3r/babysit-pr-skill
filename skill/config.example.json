@@ -8,6 +8,7 @@
   "trusted_author_associations": ["OWNER", "MEMBER", "COLLABORATOR"],
   "review_bot_login_keywords": ["codex"],
   "max_session_minutes": 90,
+  "require_up_to_date": "auto",
   "codex": {
     "enabled": true,
     "required": false
