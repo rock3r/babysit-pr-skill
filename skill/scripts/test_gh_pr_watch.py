@@ -41,7 +41,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["max_session_minutes"], 90)
         self.assertTrue(config["codex"]["enabled"])
         self.assertFalse(config["codex"]["required"])
-        self.assertFalse(config["coderabbit"]["enabled"])
+        self.assertNotIn("coderabbit", config)
         self.assertFalse(config["pr_af"]["enabled"])
         self.assertEqual(config["pr_af"]["label"], "pr-af")
         self.assertEqual(config["pr_af"]["missing_check_grace_minutes"], 5)
@@ -138,7 +138,8 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = self._write(tmp_dir, {"local_gate": "npm test", "extra": True})
             stdout, stderr = io.StringIO(), io.StringIO()
-            with patch.object(sys, "argv", ["gh_pr_watch.py", "--config", str(path), "--print-config"]), \
+            with configured(), \
+                    patch.object(sys, "argv", ["gh_pr_watch.py", "--config", str(path), "--print-config"]), \
                     patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
                 code = watch.main()
 
@@ -152,7 +153,8 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = self._write(tmp_dir, {"hung_check_minutes": "soon"})
             stderr = io.StringIO()
-            with patch.object(sys, "argv", ["gh_pr_watch.py", "--config", str(path), "--print-config"]), \
+            with configured(), \
+                    patch.object(sys, "argv", ["gh_pr_watch.py", "--config", str(path), "--print-config"]), \
                     patch.object(sys, "stdout", io.StringIO()), patch.object(sys, "stderr", stderr):
                 code = watch.main()
 
@@ -1731,90 +1733,40 @@ class ReviewListFallbackTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in new_items], ["5"])
 
 
-class CodeRabbitGateTests(unittest.TestCase):
-    """CodeRabbit gates a PR only while it shows signs of life on it."""
+class RetiredCodeRabbitTests(unittest.TestCase):
+    """The CodeRabbit gate was removed in 2.0.0. A leftover config section only warns."""
 
-    def test_gate_inert_when_no_coderabbit_activity(self):
-        gate = watch.summarize_coderabbit_gate([], [])
-        self.assertFalse(gate["active"])
-        self.assertFalse(gate["reviewing"])
-        self.assertEqual(gate["status"], "idle")
+    LEFTOVER = {"coderabbit": {"enabled": True}}
 
-    def test_gate_ignores_other_bots_reactions(self):
-        reactions = [{"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}}]
-        gate = watch.summarize_coderabbit_gate([], reactions)
-        self.assertFalse(gate["active"])
-        self.assertFalse(gate["reviewing"])
+    def test_leftover_section_is_an_unknown_key_warning(self):
+        config, warnings = watch.build_config(self.LEFTOVER)
+        self.assertEqual(warnings, ["unknown config key 'coderabbit' is ignored"])
+        self.assertNotIn("coderabbit", config)
 
-    def test_gate_reviewing_when_check_pending(self):
-        gate = watch.summarize_coderabbit_gate([{"name": "CodeRabbit", "bucket": "pending", "state": "QUEUED"}], [])
-        self.assertTrue(gate["active"])
-        self.assertTrue(gate["present_check"])
-        self.assertTrue(gate["reviewing"])
-        self.assertEqual(gate["status"], "in_progress")
+    def test_leftover_section_does_not_stop_the_watcher(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = watch.Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps(self.LEFTOVER), encoding="utf-8")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with configured(), \
+                    patch.object(sys, "argv", ["gh_pr_watch.py", "--config", str(path), "--print-config"]), \
+                    patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+                code = watch.main()
+        self.assertEqual(code, 0)
+        self.assertIn("unknown config key 'coderabbit' is ignored", stderr.getvalue())
+        self.assertNotIn("coderabbit", json.loads(stdout.getvalue())["config"])
 
-    def test_gate_reviewing_when_pending_rerun_follows_old_completed_check(self):
-        checks = [
-            {"name": "CodeRabbit", "bucket": "pass", "state": "SUCCESS", "startedAt": "0001-01-01T00:00:00Z"},
-            {"name": "CodeRabbit", "bucket": "pending", "state": "QUEUED", "startedAt": "0001-01-01T00:00:00Z"},
-        ]
-        gate = watch.summarize_coderabbit_gate(checks, [])
-        self.assertTrue(gate["reviewing"])
-        self.assertEqual(gate["status"], "in_progress")
-
-    def test_gate_active_not_reviewing_when_check_success(self):
-        gate = watch.summarize_coderabbit_gate([{"name": "CodeRabbit", "bucket": "pass", "state": "SUCCESS"}], [])
-        self.assertTrue(gate["active"])
-        self.assertFalse(gate["reviewing"])
-        self.assertEqual(gate["status"], "active")
-
-    def test_gate_blocks_when_reactions_are_unknown_after_check_completion(self):
-        gate = watch.summarize_coderabbit_gate([{"name": "CodeRabbit", "bucket": "pass", "state": "SUCCESS"}], None)
-        self.assertTrue(gate["reviewing"])
-        self.assertEqual(gate["status"], "unknown")
-
-    def test_gate_reviewing_when_coderabbit_eyes_reaction_without_check(self):
-        gate = watch.summarize_coderabbit_gate([], [{"content": "eyes", "user": {"login": "coderabbitai[bot]"}}])
-        self.assertTrue(gate["active"])
-        self.assertFalse(gate["present_check"])
-        self.assertTrue(gate["reviewing"])
-
-    def test_gate_active_not_reviewing_for_non_eyes_coderabbit_reaction(self):
-        gate = watch.summarize_coderabbit_gate([], [{"content": "+1", "user": {"login": "coderabbitai[bot]"}}])
-        self.assertTrue(gate["active"])
-        self.assertFalse(gate["reviewing"])
-        self.assertEqual(gate["status"], "active")
-
-    def test_reviewing_coderabbit_blocks_readiness_and_emits_wait_coderabbit(self):
-        gate = {"active": True, "reviewing": True, "status": "in_progress"}
-        actions = _actions_for(_open_pr(), coderabbit_gate=gate)
-        self.assertEqual(actions, ["wait_coderabbit"])
-        self.assertFalse(watch.needs_agent_attention(actions))
-        self.assertFalse(watch.needs_agent_attention(["diagnose_merge_conflict", "wait_coderabbit"]))
-
-    def test_dormant_coderabbit_allows_readiness(self):
-        gate = {"active": False, "reviewing": False, "status": "idle"}
-        self.assertEqual(_actions_for(_open_pr(), coderabbit_gate=gate), ["stop_ready_to_merge"])
-
-    def test_ci_is_not_green_while_coderabbit_reviews(self):
-        snapshot = {
-            "pr": {"review_decision": "APPROVED"},
-            "checks": _green_checks(),
-            "blocking_review_items": [],
-            "checks_terminal_elapsed_seconds": 120,
-            "coderabbit_gate": {"reviewing": True},
-        }
-        self.assertFalse(watch.is_ci_green(snapshot))
-
-    def test_coderabbit_comments_are_findings_only_when_enabled(self):
-        with configured():
+    def test_leftover_section_does_not_make_coderabbit_comments_findings(self):
+        with configured(self.LEFTOVER):
             self.assertFalse(watch.is_actionable_review_bot_login("coderabbitai[bot]"))
-        with configured({"coderabbit": {"enabled": True}}):
-            self.assertTrue(watch.is_actionable_review_bot_login("coderabbitai[bot]"))
+
+    def test_recommend_actions_takes_no_coderabbit_gate(self):
+        with self.assertRaises(TypeError):
+            _actions_for(_open_pr(), coderabbit_gate={"active": True, "reviewing": True})
 
     def _snapshot(self, overrides):
         pr = {
-            "repo": "owner/repo", "number": 21, "head_sha": "abc123",
+            "repo": "owner/repo", "number": 21, "head_sha": "abc123", "labels": [],
             "closed": False, "merged": False, "mergeable": "MERGEABLE",
             "merge_state_status": "CLEAN", "review_decision": "",
         }
@@ -1831,15 +1783,15 @@ class CodeRabbitGateTests(unittest.TestCase):
             snapshot, _ = watch.collect_snapshot(args)
         return snapshot, reactions_lookup
 
-    def test_snapshot_has_no_coderabbit_gate_when_disabled(self):
-        snapshot, _ = self._snapshot({})
-        self.assertIsNone(snapshot["coderabbit_gate"])
-
-    def test_snapshot_shares_one_reactions_lookup_between_gates(self):
-        snapshot, reactions_lookup = self._snapshot({"coderabbit": {"enabled": True}})
-        self.assertTrue(snapshot["coderabbit_gate"]["reviewing"])
-        self.assertIn("wait_coderabbit", snapshot["actions"])
+    def test_snapshot_has_no_coderabbit_gate_and_treats_its_check_like_any_check(self):
+        snapshot, reactions_lookup = self._snapshot(self.LEFTOVER)
+        self.assertNotIn("coderabbit_gate", snapshot)
+        self.assertEqual(snapshot["actions"], ["idle"])
         reactions_lookup.assert_called_once()
+
+    def test_reactions_are_read_only_for_codex(self):
+        _snapshot, reactions_lookup = self._snapshot({"codex": {"enabled": False}})
+        reactions_lookup.assert_not_called()
 
 
 PR_AF_CONFIG = {

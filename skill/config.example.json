@@ -12,9 +12,6 @@
     "enabled": true,
     "required": false
   },
-  "coderabbit": {
-    "enabled": false
-  },
   "pr_af": {
     "enabled": false,
     "label": "pr-af",

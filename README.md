@@ -32,7 +32,7 @@ Clone this repository once, then run `sync.py` with the path of the repository t
 
 ```bash
 git clone https://github.com/rock3r/babysit-pr-skill.git
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v1.0.1
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.0.0
 ```
 
 `sync.py` does the following:
@@ -50,7 +50,7 @@ edit `config.json` for the repository, and commit the folder.
 
 ```bash
 git -C babysit-pr-skill pull --tags
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v1.1.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.1.0
 ```
 
 Read [CHANGELOG.md](CHANGELOG.md) for the versions in between. Your `config.json` stays as it is. New config keys
@@ -77,7 +77,6 @@ of the wrong type stops the watcher with an error that names the key.
 | `max_session_minutes` | integer | `90` | The default for `--max-session-minutes`. |
 | `codex.enabled` | boolean | `true` | Watch the Codex review bot. When `false`, the watcher makes no Codex calls. |
 | `codex.required` | boolean | `false` | Require a Codex review of the head even on a PR where Codex never posted. |
-| `coderabbit.enabled` | boolean | `false` | Wait while CodeRabbit reviews, and treat its comments as review items. |
 | `pr_af.enabled` | boolean | `false` | Watch the label-triggered PR-AF review. When `false`, the watcher makes no PR-AF calls. |
 | `pr_af.label` | string | `"pr-af"` | The PR label that asks for a PR-AF review. |
 | `pr_af.workflow_names` | list of strings | `[]` | Names of the PR-AF workflow. |

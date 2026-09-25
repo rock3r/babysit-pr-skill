@@ -2,6 +2,25 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 2.0.0
+
+This is a major release because it removes an action and a config key. The README's versioning table counts both
+as major changes.
+
+### Removed
+
+- The optional CodeRabbit gate, which no repository used. The watcher no longer emits `wait_coderabbit`, and the
+  snapshot no longer has a `coderabbit_gate` field.
+- The `coderabbit` config section. A config file that still has it keeps working: the watcher prints the usual
+  unknown-key warning and ignores it. Delete the section to silence the warning. The config format stays at
+  version 1.
+- A CodeRabbit check is now an ordinary check. While it is pending, the watcher waits for it like for any other
+  check. Comments from `coderabbitai[bot]` are review items only when `review_bot_login_keywords` matches them.
+
+### Fixed
+
+- The tests that run the command line no longer leave their config behind for later tests.
+
 ## 1.0.1
 
 ### Fixed

@@ -42,10 +42,6 @@ DEFAULT_CONFIG = {
         # Require a Codex review of the head even when Codex never posted on the PR.
         "required": False,
     },
-    "coderabbit": {
-        # Wait for CodeRabbit while it shows signs of reviewing the PR.
-        "enabled": False,
-    },
     "pr_af": {
         # Watch the label-triggered PR-AF review workflow.
         "enabled": False,
@@ -109,9 +105,6 @@ CONFIG_VALIDATORS = {
     "codex": {
         "enabled": _check_bool,
         "required": _check_bool,
-    },
-    "coderabbit": {
-        "enabled": _check_bool,
     },
     "pr_af": {
         "enabled": _check_bool,
@@ -261,8 +254,6 @@ CODEX_BOT_LOGINS = {
     "chatgpt-codex-connector",
 }
 
-# CodeRabbit posts as coderabbitai[bot] and may add a "CodeRabbit" status check.
-CODERABBIT_KEYWORD = "coderabbit"
 STATE_STALENESS_RESET_SECONDS = 2 * 60 * 60
 
 _AUTHENTICATED_LOGIN_CACHE = None
@@ -1155,15 +1146,9 @@ def classify_codex_review_status(status_text):
     return "failed"
 
 
-def collect_codex_gate(pr, reactions=None):
-    """Codex's review state for the PR: the 👀 reaction plus proof of a review of the head.
-
-    `reactions` is the PR's issue-reactions list, shared with other gates. When it is
-    not given, this function fetches it.
-    """
-    if reactions is None:
-        reactions = get_pr_issue_reactions(pr["repo"], pr["number"])
-    codex_gate = summarize_codex_gate(reactions)
+def collect_codex_gate(pr):
+    """Codex's review state for the PR: the 👀 reaction plus proof of a review of the head."""
+    codex_gate = summarize_codex_gate(get_pr_issue_reactions(pr["repo"], pr["number"]))
     try:
         issue_comments = gh_api_list_paginated(comment_endpoints(pr["repo"], pr["number"])["issue_comment"])
         codex_gate.update(summarize_codex_head_review(issue_comments, pr["head_sha"]))
@@ -1171,66 +1156,6 @@ def collect_codex_gate(pr, reactions=None):
         # Without the summary comment we cannot prove the head was reviewed: treat as unknown.
         codex_gate.update({"status": "unknown", "active": True, "head_reviewed": False, "head_status": "none"})
     return codex_gate
-
-
-def is_coderabbit_login(login):
-    return CODERABBIT_KEYWORD in str(login or "").lower()
-
-
-def is_coderabbit_name(name):
-    return CODERABBIT_KEYWORD in str(name or "").lower()
-
-
-def _bot_has_any_reaction(reactions, login_predicate):
-    if not isinstance(reactions, list):
-        return False
-    for reaction in reactions:
-        if not isinstance(reaction, dict):
-            continue
-        user = reaction.get("user") or {}
-        if login_predicate(str(user.get("login") or "")):
-            return True
-    return False
-
-
-def summarize_coderabbit_gate(checks, reactions):
-    """Presence-conditional gate for CodeRabbit.
-
-    CodeRabbit gates a PR only when it shows signs of life: a CodeRabbit check or a
-    reaction from the CodeRabbit bot. Its comments block merge through the normal
-    review-item path. When CodeRabbit is dormant the gate does nothing, so the
-    watcher stays correct if CodeRabbit is removed from the repository.
-
-    `reviewing` is true while its check is pending, or while it has a 👀 reaction on
-    the PR. Other reactions count as a sign of life, not as "still reviewing".
-    `reactions` is None when the reactions lookup failed.
-    """
-    cr_checks = [
-        check for check in checks or []
-        if isinstance(check, dict)
-        and (is_coderabbit_name(check.get("name")) or is_coderabbit_name(check.get("workflow")))
-    ]
-    check_present = bool(cr_checks)
-    # Any pending CodeRabbit check means it is still reviewing, whatever the order of
-    # an older completed entry in the `gh pr checks` output.
-    check_pending = any(is_pending_check(check) for check in cr_checks)
-    reactions_unknown = reactions is None
-    has_eyes = _bot_has_eyes_reaction(reactions, is_coderabbit_login)
-    has_any_reaction = _bot_has_any_reaction(reactions, is_coderabbit_login)
-
-    active = check_present or has_any_reaction
-    # Once CodeRabbit has a check, a failed reaction lookup cannot prove that its
-    # review reaction is gone. Fail closed until reactions can be read again.
-    reviewing = check_pending or has_eyes or (check_present and reactions_unknown)
-    if reactions_unknown and check_present:
-        status = "unknown"
-    elif reviewing:
-        status = "in_progress"
-    elif active:
-        status = "active"
-    else:
-        status = "idle"
-    return {"active": active, "present_check": check_present, "reviewing": reviewing, "status": status}
 
 
 def get_authenticated_login():
@@ -1551,10 +1476,7 @@ def is_actionable_review_bot_login(login):
     if not is_bot_login(login):
         return False
     lower_login = login.lower()
-    keywords = list(CONFIG["review_bot_login_keywords"])
-    if CONFIG["coderabbit"]["enabled"]:
-        keywords.append(CODERABBIT_KEYWORD)
-    return any(keyword.lower() in lower_login for keyword in keywords)
+    return any(keyword.lower() in lower_login for keyword in CONFIG["review_bot_login_keywords"])
 
 
 def is_pr_af_review_item(item, pr_af_review_ids=None, pr_af_check_present=True):
@@ -1839,7 +1761,6 @@ def is_pr_ready_to_merge(
     checks_terminal_elapsed=None,
     blocking_review_items=None,
     codex_gate=None,
-    coderabbit_gate=None,
     pr_af_gate=None,
 ):
     if pr["closed"] or pr["merged"]:
@@ -1869,8 +1790,6 @@ def is_pr_ready_to_merge(
     if codex_waiting_for_head_review(codex_gate) or codex_review_failed(codex_gate):
         return False
     if codex_required() and not (codex_gate and codex_gate.get("head_reviewed")):
-        return False
-    if coderabbit_gate and bool(coderabbit_gate.get("reviewing")):
         return False
     if pr_af_holds_readiness(pr_af_gate):
         return False
@@ -2066,7 +1985,6 @@ def recommend_actions(
     checks_terminal_elapsed=None,
     blocking_review_items=None,
     codex_gate=None,
-    coderabbit_gate=None,
     pr_af_gate=None,
 ):
     actions = []
@@ -2098,7 +2016,6 @@ def recommend_actions(
         checks_terminal_elapsed=checks_terminal_elapsed,
         blocking_review_items=blocking_review_items,
         codex_gate=codex_gate,
-        coderabbit_gate=coderabbit_gate,
         pr_af_gate=pr_af_gate,
     ):
         actions.append("stop_ready_to_merge")
@@ -2119,9 +2036,6 @@ def recommend_actions(
             actions.append("request_codex_review")
         else:
             actions.append("wait_codex")
-
-    if coderabbit_gate and bool(coderabbit_gate.get("reviewing")):
-        actions.append("wait_coderabbit")
 
     if pr_af_holds_readiness(pr_af_gate):
         actions.append("wait_pr_af")
@@ -2194,12 +2108,7 @@ def collect_snapshot(args):
         authenticated_login = None
     # Read Codex's state before scanning review comments. Codex posts its findings before it
     # marks the head reviewed, so this order can never pair "reviewed" with a stale scan.
-    # Both review-bot gates read the PR's reactions, so fetch them once.
-    reactions = None
-    if CONFIG["codex"]["enabled"] or CONFIG["coderabbit"]["enabled"]:
-        reactions = get_pr_issue_reactions(pr["repo"], pr["number"])
-    codex_gate = collect_codex_gate(pr, reactions=reactions) if CONFIG["codex"]["enabled"] else None
-    coderabbit_gate = summarize_coderabbit_gate(checks, reactions) if CONFIG["coderabbit"]["enabled"] else None
+    codex_gate = collect_codex_gate(pr) if CONFIG["codex"]["enabled"] else None
     new_review_items, blocking_review_items = fetch_new_review_items(
         pr,
         state,
@@ -2246,7 +2155,6 @@ def collect_snapshot(args):
         checks_terminal_elapsed=checks_terminal_elapsed,
         blocking_review_items=blocking_review_items,
         codex_gate=codex_gate,
-        coderabbit_gate=coderabbit_gate,
         pr_af_gate=pr_af_gate,
     )
 
@@ -2260,7 +2168,6 @@ def collect_snapshot(args):
         "checks": checks_summary,
         "failed_runs": failed_runs,
         "codex_gate": codex_gate,
-        "coderabbit_gate": coderabbit_gate,
         "pr_af_gate": pr_af_gate,
         "hung_checks": hung_checks,
         "new_review_items": new_review_items,
@@ -2368,7 +2275,6 @@ def is_ci_green(snapshot):
     review_decision = str(pr.get("review_decision") or "")
     codex_gate = snapshot.get("codex_gate") or {}
     codex_reviewing = bool(codex_gate.get("reviewing"))
-    coderabbit_reviewing = bool((snapshot.get("coderabbit_gate") or {}).get("reviewing"))
     pr_af_running = str((snapshot.get("pr_af_gate") or {}).get("status") or "") == "in_progress"
     return (
         bool(checks.get("all_terminal"))
@@ -2378,7 +2284,6 @@ def is_ci_green(snapshot):
         and not blocking_review_items
         and review_decision not in MERGE_BLOCKING_REVIEW_DECISIONS
         and not codex_reviewing
-        and not coderabbit_reviewing
         and not pr_af_running
     )
 
@@ -2410,7 +2315,6 @@ def snapshot_change_key(snapshot):
         ),
         tuple(snapshot.get("actions") or []),
         bool(codex_gate.get("reviewing")),
-        bool((snapshot.get("coderabbit_gate") or {}).get("reviewing")),
         str((snapshot.get("pr_af_gate") or {}).get("status") or ""),
         str((snapshot.get("pr_af_gate") or {}).get("conclusion") or ""),
         # Include whether the checks-terminal grace period is still active.
@@ -2433,7 +2337,6 @@ def _grace_period_active(snapshot):
 # Waits for a review bot that is still working on the current head.
 BOT_WAIT_ACTIONS = {
     "wait_codex",
-    "wait_coderabbit",
     "wait_pr_af",
 }
 PASSIVE_WAIT_ACTIONS = {"idle"} | BOT_WAIT_ACTIONS

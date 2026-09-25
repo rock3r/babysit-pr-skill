@@ -47,7 +47,6 @@ stops the watcher with an error that names the key.
 | `max_session_minutes` | `90` | The default for `--max-session-minutes`. |
 | `codex.enabled` | `true` | Watch the Codex review bot. |
 | `codex.required` | `false` | Require a Codex review of the head, even on a PR where Codex never posted. |
-| `coderabbit.enabled` | `false` | Wait for CodeRabbit while it reviews, and treat its comments as review items. |
 | `pr_af.enabled` | `false` | Watch the label-triggered PR-AF review. The other `pr_af` keys describe it. |
 | `pr_af.label` | `"pr-af"` | The PR label that asks for a PR-AF review. |
 | `pr_af.workflow_names`, `pr_af.check_names` | `[]` | The names of the PR-AF workflow and check. A name matches either list. |
@@ -95,7 +94,7 @@ The output is JSON lines. Where the actions are depends on the mode:
 | `--watch` | `payload.snapshot.actions` on `snapshot` events, `payload.actions` on `stop` events |
 
 Other useful snapshot fields are `checks` (pending, failed, passed and skipping counts, `all_terminal`,
-`required_missing`, and `check_count`), `failed_runs` (with `retry_eligible`), `codex_gate`, `coderabbit_gate`, `pr_af_gate`,
+`required_missing`, and `check_count`), `failed_runs` (with `retry_eligible`), `codex_gate`, `pr_af_gate`,
 `hung_checks`, `new_review_items`, `blocking_review_items`, and `retry_state`.
 
 `blocking_review_items` lists unresolved inline comments. While it is not empty, the watcher never reports the PR
@@ -111,7 +110,6 @@ again.
 |---|---|---|---|
 | `idle` | CI is running and there is nothing to do. | no | no |
 | `wait_codex` | Codex is reviewing, or has not finished a review of the head yet. Do not push or merge. | no | no |
-| `wait_coderabbit` | CodeRabbit is reviewing. Do not push or merge. | no | no |
 | `wait_pr_af` | A PR-AF check for the head is running, or has not appeared yet. | no | no |
 | `process_review_comment` | There are new or unresolved review items. Triage them. | yes | no |
 | `diagnose_ci_failure` | A check failed. Classify it before you act. | yes | no |
@@ -163,9 +161,6 @@ watcher also requires a **Completed** review of the head commit (`codex_gate.hea
 table does not have Codex active, so this check does not apply, unless `codex.required` is `true`. The table is a
 status, not a finding, so the watcher never reports it as a review item. When the reactions cannot be read, the
 gate stays closed.
-
-**CodeRabbit** gates a PR only while it shows signs of life on it: a CodeRabbit check or a reaction from its bot.
-While `coderabbit_gate.reviewing` is `true`, do not push or merge.
 
 **PR-AF** runs when the PR has the `pr_af.label` label, and again on every push while the label stays. Its check is
 advisory. A running PR-AF check on the head holds readiness with `wait_pr_af`. A failed, skipped, cancelled, or hung

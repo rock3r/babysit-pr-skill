@@ -67,7 +67,7 @@ gh api "repos/{owner}/{repo}/pulls/<n>/comments?per_page=100&page=<p>"
 # Review submissions. When this call fails, the watcher lists reviews through GraphQL instead.
 gh api "repos/{owner}/{repo}/pulls/<n>/reviews?per_page=100&page=<p>"
 
-# Reactions on the PR (the Codex and CodeRabbit 👀 reactions), all pages
+# Reactions on the PR (the Codex 👀 reaction), all pages
 gh api "repos/{owner}/{repo}/issues/<n>/reactions?per_page=100&page=<p>"
 
 # The authenticated login, so the watcher can skip its own comments
@@ -105,7 +105,7 @@ head.
 |---|---|
 | `bucket` | Pass, fail, pending, and skip classification |
 | `state` | Extra pending detection |
-| `name` / `workflow` | Reports, expected skips, required checks, and the CodeRabbit and PR-AF checks |
+| `name` / `workflow` | Reports, expected skips, required checks, and the PR-AF checks |
 | `link` | Links to failed runs |
 | `startedAt` / `completedAt` | Hung-check detection and the latest PR-AF run. GitHub reports `0001-01-01T00:00:00Z` for a check that has not started. The watcher ignores that value. |
 
