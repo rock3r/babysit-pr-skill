@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -12,6 +13,212 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import gh_pr_watch as watch
+
+
+def configured(overrides=None):
+    """Patch the watcher's active config with `overrides` merged over the defaults."""
+    config, _warnings = watch.build_config(overrides or {})
+    return patch.object(watch, "CONFIG", config)
+
+
+class ConfigTests(unittest.TestCase):
+    def _write(self, tmp_dir, payload, name="config.json"):
+        path = watch.Path(tmp_dir) / name
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_defaults_match_the_documented_behaviour(self):
+        config, warnings = watch.build_config({})
+
+        self.assertEqual(warnings, [])
+        self.assertIsNone(config["local_gate"])
+        self.assertEqual(config["expected_skipped_checks"], [])
+        self.assertEqual(config["required_checks"], [])
+        self.assertEqual(config["retry_eligible_workflow_keywords"], ["e2e"])
+        self.assertEqual(config["hung_check_minutes"], 30)
+        self.assertEqual(config["trusted_author_associations"], ["OWNER", "MEMBER", "COLLABORATOR"])
+        self.assertEqual(config["review_bot_login_keywords"], ["codex"])
+        self.assertEqual(config["max_session_minutes"], 90)
+        self.assertTrue(config["codex"]["enabled"])
+        self.assertFalse(config["codex"]["required"])
+        self.assertFalse(config["coderabbit"]["enabled"])
+        self.assertFalse(config["pr_af"]["enabled"])
+        self.assertEqual(config["pr_af"]["label"], "pr-af")
+        self.assertEqual(config["pr_af"]["missing_check_grace_minutes"], 5)
+        self.assertFalse(config["cleanup"]["branch_delete_requires_approval"])
+
+    def test_missing_default_file_gives_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config, warnings = watch.load_config(watch.Path(tmp_dir) / "config.json", explicit=False)
+
+        self.assertEqual(config, watch.build_config({})[0])
+        self.assertEqual(warnings, [])
+
+    def test_missing_explicit_file_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaises(watch.ConfigError):
+                watch.load_config(watch.Path(tmp_dir) / "nope.json", explicit=True)
+
+    def test_partial_file_keeps_defaults_for_missing_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = self._write(tmp_dir, {"local_gate": "make check", "pr_af": {"enabled": True, "check_names": ["x"]}})
+            config, warnings = watch.load_config(path, explicit=True)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(config["local_gate"], "make check")
+        self.assertTrue(config["pr_af"]["enabled"])
+        self.assertEqual(config["pr_af"]["label"], "pr-af")
+        self.assertEqual(config["retry_eligible_workflow_keywords"], ["e2e"])
+
+    def test_unknown_keys_warn_instead_of_failing(self):
+        config, warnings = watch.build_config({"surprise": 1, "pr_af": {"colour": "blue"}})
+
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("surprise" in warning for warning in warnings))
+        self.assertTrue(any("pr_af.colour" in warning for warning in warnings))
+        self.assertNotIn("surprise", config)
+
+    def test_wrong_types_are_rejected(self):
+        bad_values = [
+            {"local_gate": 42},
+            {"expected_skipped_checks": "recordings"},
+            {"expected_skipped_checks": [1]},
+            {"hung_check_minutes": "30"},
+            {"hung_check_minutes": 0},
+            {"hung_check_minutes": True},
+            {"max_session_minutes": -1},
+            {"codex": {"enabled": "yes"}},
+            {"codex": []},
+            {"pr_af": {"missing_check_grace_minutes": -1}},
+            {"cleanup": {"branch_delete_requires_approval": 1}},
+            {"version": "1"},
+        ]
+        for raw in bad_values:
+            with self.subTest(raw=raw):
+                with self.assertRaises(watch.ConfigError):
+                    watch.build_config(raw)
+
+    def test_top_level_must_be_an_object(self):
+        with self.assertRaises(watch.ConfigError):
+            watch.build_config(["not", "an", "object"])
+
+    def test_invalid_json_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = self._write(tmp_dir, "{ not json")
+            with self.assertRaises(watch.ConfigError):
+                watch.load_config(path, explicit=True)
+
+    def test_newer_config_version_is_rejected(self):
+        with self.assertRaises(watch.ConfigError):
+            watch.build_config({"version": 2})
+
+    def test_enabled_pr_af_without_names_warns(self):
+        _config, warnings = watch.build_config({"pr_af": {"enabled": True}})
+
+        self.assertTrue(any("pr_af" in warning for warning in warnings))
+
+    def test_default_config_path_is_next_to_the_scripts_directory(self):
+        expected = watch.Path(watch.__file__).resolve().parent.parent / "config.json"
+
+        self.assertEqual(watch.default_config_path(), expected)
+
+    def test_example_config_is_valid_and_documents_every_key(self):
+        example = watch.Path(SCRIPT_DIR).resolve().parent / "config.example.json"
+        raw = json.loads(example.read_text(encoding="utf-8"))
+
+        config, warnings = watch.build_config(raw)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(set(raw), set(watch.DEFAULT_CONFIG))
+        for section, value in watch.DEFAULT_CONFIG.items():
+            if isinstance(value, dict):
+                self.assertEqual(set(raw[section]), set(value), section)
+
+    def test_print_config_reports_the_effective_config_and_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = self._write(tmp_dir, {"local_gate": "npm test", "extra": True})
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(sys, "argv", ["gh_pr_watch.py", "--config", str(path), "--print-config"]), \
+                    patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+                code = watch.main()
+
+        self.assertEqual(code, 0)
+        printed = json.loads(stdout.getvalue())
+        self.assertEqual(printed["config"]["local_gate"], "npm test")
+        self.assertEqual(printed["config_file"], str(path))
+        self.assertIn("extra", stderr.getvalue())
+
+    def test_bad_config_makes_main_fail_with_a_message(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = self._write(tmp_dir, {"hung_check_minutes": "soon"})
+            stderr = io.StringIO()
+            with patch.object(sys, "argv", ["gh_pr_watch.py", "--config", str(path), "--print-config"]), \
+                    patch.object(sys, "stdout", io.StringIO()), patch.object(sys, "stderr", stderr):
+                code = watch.main()
+
+        self.assertEqual(code, 1)
+        self.assertIn("hung_check_minutes", stderr.getvalue())
+
+    def test_max_session_minutes_comes_from_config_when_the_flag_is_absent(self):
+        with configured({"max_session_minutes": 15}), \
+                patch.object(sys, "argv", ["gh_pr_watch.py", "--snapshot"]):
+            args = watch.parse_args()
+
+        self.assertEqual(args.max_session_minutes, 15)
+
+    def test_max_session_minutes_flag_overrides_config(self):
+        with configured({"max_session_minutes": 15}), \
+                patch.object(sys, "argv", ["gh_pr_watch.py", "--snapshot", "--max-session-minutes", "40"]):
+            args = watch.parse_args()
+
+        self.assertEqual(args.max_session_minutes, 40)
+
+
+class ConfiguredBehaviourTests(unittest.TestCase):
+    def test_expected_skipped_checks_come_from_config(self):
+        checks = [
+            {"name": "deploy", "bucket": "skipping", "state": "SKIPPING"},
+            {"name": "Deploy", "bucket": "skipping", "state": "SKIPPING"},
+            {"name": "other", "bucket": "skipping", "state": "SKIPPING"},
+            # A neutral result is not a skip, so it still needs a look.
+            {"name": "deploy", "bucket": "neutral", "state": "NEUTRAL"},
+        ]
+
+        with configured({"expected_skipped_checks": ["deploy"]}):
+            summary = watch.summarize_checks(checks)
+
+        self.assertEqual(summary["skipping_count"], 2)
+
+    def test_no_skip_is_expected_by_default(self):
+        checks = [{"name": "recordings", "bucket": "skipping", "state": "SKIPPED"}]
+
+        with configured():
+            self.assertEqual(watch.summarize_checks(checks)["skipping_count"], 1)
+
+    def test_retry_keywords_come_from_config(self):
+        with configured({"retry_eligible_workflow_keywords": ["android"]}):
+            self.assertTrue(watch.is_retry_eligible_workflow_name("Android tests"))
+            self.assertFalse(watch.is_retry_eligible_workflow_name("E2E"))
+
+    def test_hung_threshold_comes_from_config(self):
+        with configured({"hung_check_minutes": 12}):
+            self.assertEqual(watch.hung_threshold_for_check("anything"), 12 * 60)
+
+    def test_trusted_author_associations_come_from_config(self):
+        item = {"author": "someone", "author_association": "CONTRIBUTOR"}
+
+        with configured():
+            self.assertFalse(watch.is_trusted_human_review_author(item, "octocat"))
+        with configured({"trusted_author_associations": ["CONTRIBUTOR"]}):
+            self.assertTrue(watch.is_trusted_human_review_author(item, "octocat"))
+
+    def test_review_bot_login_keywords_come_from_config(self):
+        with configured():
+            self.assertFalse(watch.is_actionable_review_bot_login("cursor[bot]"))
+        with configured({"review_bot_login_keywords": ["codex", "cursor"]}):
+            self.assertTrue(watch.is_actionable_review_bot_login("cursor[bot]"))
+            # A human login never counts as a review bot, whatever its name.
+            self.assertFalse(watch.is_actionable_review_bot_login("cursor-fan"))
 
 
 class RetryEligibilityTests(unittest.TestCase):
@@ -717,7 +924,7 @@ class RetryEligibilityTests(unittest.TestCase):
         ]
         pending_first_seen = {"ci|CI|https://example.invalid/check": 100}
 
-        with patch.object(watch.time, "time", return_value=watch.HUNG_CHECK_THRESHOLDS_SECONDS["default"] + 101):
+        with patch.object(watch.time, "time", return_value=watch.hung_threshold_for_check("CI") + 101):
             hung = watch.hung_checks_from_checks(checks, pending_first_seen)
 
         self.assertEqual(len(hung), 1)
@@ -1308,7 +1515,8 @@ class SkippingChecksTests(unittest.TestCase):
             {"name": "recordings", "workflow": "CI", "bucket": "skipping", "state": "SKIPPED"},
         ]
 
-        summary = watch.summarize_checks(checks)
+        with configured({"expected_skipped_checks": ["recordings"]}):
+            summary = watch.summarize_checks(checks)
 
         self.assertEqual(summary["skipping_count"], 0)
         self.assertEqual(summary["passed_count"], 1)

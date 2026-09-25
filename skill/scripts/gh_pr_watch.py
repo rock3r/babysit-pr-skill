@@ -2,6 +2,7 @@
 """Watch GitHub PR CI and review activity for PR babysitting workflows."""
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -12,6 +13,191 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
+
+# Project settings live in `config.json` next to the `scripts/` directory. A missing
+# file or a missing key means "use the default". The defaults match a repository with
+# one CI workflow, Codex as the only review bot, and nothing that is skipped by design.
+CONFIG_VERSION = 1
+DEFAULT_CONFIG = {
+    "version": CONFIG_VERSION,
+    # The command the agent runs locally before every push, e.g. "./gradlew check".
+    "local_gate": None,
+    # Check names whose `skipping` result is expected on PRs (e.g. a deploy job).
+    "expected_skipped_checks": [],
+    # Check names that must be present and passed before the PR counts as ready.
+    "required_checks": [],
+    # Workflow name fragments whose failures are worth an automatic rerun.
+    "retry_eligible_workflow_keywords": ["e2e"],
+    # A check that stays pending longer than this is reported as hung.
+    "hung_check_minutes": 30,
+    # Comments from these author associations count as trusted human review.
+    "trusted_author_associations": ["OWNER", "MEMBER", "COLLABORATOR"],
+    # Login fragments of `[bot]` accounts whose comments are review findings.
+    "review_bot_login_keywords": ["codex"],
+    # Default for --max-session-minutes.
+    "max_session_minutes": 90,
+    "codex": {
+        # Watch the Codex review bot (its 👀 reaction and its review summary).
+        "enabled": True,
+        # Require a Codex review of the head even when Codex never posted on the PR.
+        "required": False,
+    },
+    "coderabbit": {
+        # Wait for CodeRabbit while it shows signs of reviewing the PR.
+        "enabled": False,
+    },
+    "pr_af": {
+        # Watch the label-triggered PR-AF review workflow.
+        "enabled": False,
+        "label": "pr-af",
+        "workflow_names": [],
+        "check_names": [],
+        "review_body_markers": [],
+        "review_author_login": "github-actions[bot]",
+        "missing_check_grace_minutes": 5,
+    },
+    "cleanup": {
+        # When true, the agent must ask the owner before deleting a merged branch.
+        "branch_delete_requires_approval": False,
+    },
+}
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_positive_int(value):
+    return _is_int(value) and value > 0, "a whole number greater than 0"
+
+
+def _check_non_negative_int(value):
+    return _is_int(value) and value >= 0, "a whole number of 0 or more"
+
+
+def _check_bool(value):
+    return isinstance(value, bool), "true or false"
+
+
+def _check_string(value):
+    return isinstance(value, str) and bool(value.strip()), "a non-empty string"
+
+
+def _check_optional_string(value):
+    return value is None or (isinstance(value, str) and bool(value.strip())), "a non-empty string or null"
+
+
+def _check_string_list(value):
+    ok = isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
+    return ok, "a list of non-empty strings"
+
+
+CONFIG_VALIDATORS = {
+    "version": _check_positive_int,
+    "local_gate": _check_optional_string,
+    "expected_skipped_checks": _check_string_list,
+    "required_checks": _check_string_list,
+    "retry_eligible_workflow_keywords": _check_string_list,
+    "hung_check_minutes": _check_positive_int,
+    "trusted_author_associations": _check_string_list,
+    "review_bot_login_keywords": _check_string_list,
+    "max_session_minutes": _check_positive_int,
+    "codex": {
+        "enabled": _check_bool,
+        "required": _check_bool,
+    },
+    "coderabbit": {
+        "enabled": _check_bool,
+    },
+    "pr_af": {
+        "enabled": _check_bool,
+        "label": _check_string,
+        "workflow_names": _check_string_list,
+        "check_names": _check_string_list,
+        "review_body_markers": _check_string_list,
+        "review_author_login": _check_string,
+        "missing_check_grace_minutes": _check_non_negative_int,
+    },
+    "cleanup": {
+        "branch_delete_requires_approval": _check_bool,
+    },
+}
+
+
+def build_config(raw):
+    """Merge `raw` over the defaults. Returns (config, warnings).
+
+    Unknown keys produce a warning, not an error, so an older watcher can read a newer
+    file. A value of the wrong type raises ConfigError: guessing could change what the
+    watcher treats as safe to merge.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError("the config file must contain a JSON object")
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    warnings = []
+    for key, value in raw.items():
+        validator = CONFIG_VALIDATORS.get(key)
+        if validator is None:
+            warnings.append(f"unknown config key '{key}' is ignored")
+            continue
+        if isinstance(validator, dict):
+            if not isinstance(value, dict):
+                raise ConfigError(f"config key '{key}' must be a JSON object")
+            for sub_key, sub_value in value.items():
+                sub_validator = validator.get(sub_key)
+                if sub_validator is None:
+                    warnings.append(f"unknown config key '{key}.{sub_key}' is ignored")
+                    continue
+                ok, expected = sub_validator(sub_value)
+                if not ok:
+                    raise ConfigError(f"config key '{key}.{sub_key}' must be {expected}")
+                config[key][sub_key] = copy.deepcopy(sub_value)
+            continue
+        ok, expected = validator(value)
+        if not ok:
+            raise ConfigError(f"config key '{key}' must be {expected}")
+        config[key] = copy.deepcopy(value)
+    if config["version"] > CONFIG_VERSION:
+        raise ConfigError(
+            f"config version {config['version']} is newer than this watcher supports "
+            f"({CONFIG_VERSION}); update the skill"
+        )
+    pr_af = config["pr_af"]
+    if pr_af["enabled"] and not (pr_af["workflow_names"] or pr_af["check_names"]):
+        warnings.append(
+            "pr_af is enabled but pr_af.workflow_names and pr_af.check_names are empty, "
+            "so no check can be recognised as PR-AF"
+        )
+    return config, warnings
+
+
+def default_config_path():
+    return Path(__file__).resolve().parent.parent / "config.json"
+
+
+def load_config(path, explicit):
+    """Read and validate a config file. Returns (config, warnings).
+
+    A missing file is fine when the watcher looks in its default place, and an error
+    when the caller named the file with --config.
+    """
+    path = Path(path)
+    if not path.exists():
+        if explicit:
+            raise ConfigError(f"config file not found: {path}")
+        return build_config({})
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        raise ConfigError(f"config file is not valid JSON: {path}: {err}") from err
+    return build_config(raw)
+
+
+CONFIG = build_config({})[0]
 
 FAILED_RUN_CONCLUSIONS = {
     "failure",
@@ -27,16 +213,6 @@ PENDING_CHECK_STATES = {
     "PENDING",
     "WAITING",
     "REQUESTED",
-}
-# Login keyword fragments that identify actionable review bots.
-# A bot comment is surfaced when its login contains any of these keywords.
-REVIEW_BOT_LOGIN_KEYWORDS = {
-    "codex",
-}
-TRUSTED_AUTHOR_ASSOCIATIONS = {
-    "OWNER",
-    "MEMBER",
-    "COLLABORATOR",
 }
 MERGE_BLOCKING_REVIEW_DECISIONS = {
     "REVIEW_REQUIRED",
@@ -62,33 +238,12 @@ GREEN_STATE_MAX_POLL_SECONDS = 60
 # that narrow window, causing the agent to merge before findings are ever seen.
 CHECKS_TERMINAL_GRACE_PERIOD_SECONDS = 60
 
-
-# Per-check-name hung thresholds: if a check has been IN_PROGRESS longer than
-# this many seconds without completing, surface a diagnose_hung_check action.
-# Matched by substring of the lowercased check name; "default" is the fallback.
-HUNG_CHECK_THRESHOLDS_SECONDS = {
-    "default": 30 * 60,  # CI / E2E: normal 5-6 min, slow-but-legit up to ~20 min
-}
-
-# Retry budget should focus on historically flaky checks. Based on recent PR
-# failure analysis, CI workflow failures are usually deterministic
-# lint/static-analysis/code issues, while E2E failures are more likely to be
-# transient and worth one or more reruns.
 # Codex keeps one "Codex Review Summary" status table on the PR and edits it on every review.
 # It never carries a finding, so it must not surface as a review item.
 STATUS_ONLY_BOT_COMMENT_MARKER = "<!-- codex-pull-request-review-summary -->"
 
 GH_PR_CHECKS_STATE_EXIT_CODES = (0, 1, 8)
 
-# Jobs that are skipped on every PR by design, for example a job that only runs on
-# pushes to main. A skipped run of such a job on a PR is normal, not a blocker.
-EXPECTED_SKIPPED_CHECK_NAMES = {
-    "recordings",
-}
-
-RETRY_ELIGIBLE_WORKFLOW_KEYWORDS = {
-    "e2e",
-}
 # Login keyword fragments for Codex bot, used for emoji reaction gate detection.
 # Codex signals it is reviewing a PR by adding a 👀 reaction; it either posts a
 # review with comments (issues found) or removes the reaction silently (clean).
@@ -97,7 +252,6 @@ CODEX_BOT_LOGIN_KEYWORDS = {
     "chatgpt-codex",
 }
 
-MAX_SESSION_MINUTES_DEFAULT = 90
 STATE_STALENESS_RESET_SECONDS = 2 * 60 * 60
 
 _AUTHENTICATED_LOGIN_CACHE = None
@@ -143,11 +297,20 @@ def parse_args():
     parser.add_argument(
         "--max-session-minutes",
         type=int,
-        default=MAX_SESSION_MINUTES_DEFAULT,
+        default=None,
         help=(
-            "In --watch mode, stop with stop_session_timeout after this many minutes "
-            f"(default: {MAX_SESSION_MINUTES_DEFAULT})"
+            "Stop with stop_session_timeout after this many minutes "
+            "(default: max_session_minutes from config.json, else 90)"
         ),
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to the project config file (default: config.json next to scripts/)",
+    )
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help="Print the effective config as JSON and exit",
     )
     parser.add_argument(
         "--json",
@@ -156,6 +319,8 @@ def parse_args():
     )
     args = parser.parse_args()
 
+    if args.max_session_minutes is None:
+        args.max_session_minutes = CONFIG["max_session_minutes"]
     if args.poll_seconds <= 0:
         parser.error("--poll-seconds must be > 0")
     if args.max_flaky_retries < 0:
@@ -408,6 +573,11 @@ def is_pending_check(check):
     return bucket == "pending" or state in PENDING_CHECK_STATES
 
 
+def is_expected_skipped_check(check):
+    name = str(check.get("name") or "").strip().lower()
+    return name in {str(item).strip().lower() for item in CONFIG["expected_skipped_checks"]}
+
+
 def summarize_checks(checks):
     pending_count = 0
     failed_count = 0
@@ -422,7 +592,10 @@ def summarize_checks(checks):
         elif bucket == "pass":
             passed_count += 1
         elif bucket in ("neutral", "skipping"):
-            if str(check.get("name") or "") in EXPECTED_SKIPPED_CHECK_NAMES:
+            # A job that is skipped on every PR by design (for example one that only runs
+            # on pushes to main) is not a blocker. A neutral result is not a skip, so it
+            # still needs a look.
+            if bucket == "skipping" and is_expected_skipped_check(check):
                 continue
             skipping_count += 1
     return {
@@ -463,7 +636,7 @@ def get_workflow_runs_for_sha(repo, head_sha):
 
 def is_retry_eligible_workflow_name(workflow_name):
     lower = str(workflow_name or "").lower()
-    return any(keyword in lower for keyword in RETRY_ELIGIBLE_WORKFLOW_KEYWORDS)
+    return any(keyword.lower() in lower for keyword in CONFIG["retry_eligible_workflow_keywords"])
 
 
 def is_retry_eligible_failed_run(run):
@@ -834,7 +1007,7 @@ def is_actionable_review_bot_login(login):
     if not is_bot_login(login):
         return False
     lower_login = login.lower()
-    return any(keyword in lower_login for keyword in REVIEW_BOT_LOGIN_KEYWORDS)
+    return any(keyword.lower() in lower_login for keyword in CONFIG["review_bot_login_keywords"])
 
 
 def is_actionable_review_bot_item(item):
@@ -850,7 +1023,7 @@ def is_trusted_human_review_author(item, authenticated_login):
     if not author:
         return False
     association = str(item.get("author_association") or "").upper()
-    return association in TRUSTED_AUTHOR_ASSOCIATIONS
+    return association in {str(item).upper() for item in CONFIG["trusted_author_associations"]}
 
 
 def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
@@ -1138,13 +1311,8 @@ def update_pending_checks_first_seen(state, checks, now_seconds):
 
 def hung_threshold_for_check(check_name):
     """Return the hung-detection threshold in seconds for a given check name."""
-    lower = (check_name or "").lower()
-    for keyword, threshold in HUNG_CHECK_THRESHOLDS_SECONDS.items():
-        if keyword == "default":
-            continue
-        if keyword in lower:
-            return threshold
-    return HUNG_CHECK_THRESHOLDS_SECONDS["default"]
+    _ = check_name
+    return int(CONFIG["hung_check_minutes"]) * 60
 
 
 def hung_checks_from_checks(checks, pending_checks_first_seen_at):
@@ -1660,8 +1828,33 @@ def run_once(args):
         time.sleep(poll_seconds)
 
 
+def activate_config(argv):
+    """Load the config named by --config (or the default file) into CONFIG."""
+    global CONFIG
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config")
+    known, _unknown = pre_parser.parse_known_args(argv)
+    if known.config:
+        path, explicit = Path(known.config), True
+    else:
+        path, explicit = default_config_path(), False
+    config, warnings = load_config(path, explicit=explicit)
+    for warning in warnings:
+        sys.stderr.write(f"gh_pr_watch.py config warning: {warning}\n")
+    CONFIG = config
+    return path if path.exists() else None
+
+
 def main():
+    try:
+        config_file = activate_config(sys.argv[1:])
+    except ConfigError as err:
+        sys.stderr.write(f"gh_pr_watch.py config error: {err}\n")
+        return 1
     args = parse_args()
+    if args.print_config:
+        print_json({"config": CONFIG, "config_file": str(config_file) if config_file else None})
+        return 0
     try:
         if args.retry_failed_now:
             print_json(retry_failed_now(args))
