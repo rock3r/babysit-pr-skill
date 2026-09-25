@@ -629,7 +629,33 @@ def summarize_checks(checks):
         "passed_count": passed_count,
         "skipping_count": skipping_count,
         "all_terminal": pending_count == 0,
+        "required_missing": missing_required_checks(checks),
     }
+
+
+def missing_required_checks(checks):
+    """Names from `required_checks` that have no passing check on the PR.
+
+    Without this, a lone third-party check that passes could make the PR look
+    ready before the project's own CI has even registered.
+    """
+    passed = {
+        str(check.get("name") or "").strip().lower()
+        for check in checks
+        if isinstance(check, dict) and str(check.get("bucket") or "").lower() == "pass"
+    }
+    return [name for name in CONFIG["required_checks"] if name.strip().lower() not in passed]
+
+
+def has_green_check_set(checks_summary):
+    """At least one check passed and every required check is among them.
+
+    An empty check set usually means GitHub has not registered the checks for a new
+    push yet. It must never read as green.
+    """
+    if int(checks_summary.get("passed_count") or 0) <= 0:
+        return False
+    return not checks_summary.get("required_missing")
 
 
 def get_workflow_runs_for_sha(repo, head_sha):
@@ -1272,6 +1298,8 @@ def is_pr_ready_to_merge(
         or checks_summary.get("skipping_count", 0) > 0
     ):
         return False
+    if not has_green_check_set(checks_summary):
+        return False
     if new_review_items:
         return False
     if blocking_review_items:
@@ -1325,11 +1353,27 @@ def is_merge_blocked_without_reason(pr, checks_summary, checks_terminal_elapsed)
         or int(checks_summary.get("skipping_count") or 0) > 0
     ):
         return False
+    if not has_green_check_set(checks_summary):
+        return False
     # GitHub can lag behind the checks for a moment. Give it the same grace period
     # that review bots get.
-    if checks_terminal_elapsed is None or checks_terminal_elapsed < CHECKS_TERMINAL_GRACE_PERIOD_SECONDS:
+    return grace_period_elapsed(checks_terminal_elapsed)
+
+
+def grace_period_elapsed(checks_terminal_elapsed):
+    return (
+        checks_terminal_elapsed is not None
+        and checks_terminal_elapsed >= CHECKS_TERMINAL_GRACE_PERIOD_SECONDS
+    )
+
+
+def is_required_check_missing(checks_summary, checks_terminal_elapsed):
+    """Every check is done, but a required check never passed or never appeared."""
+    if not checks_summary.get("required_missing"):
         return False
-    return True
+    if not checks_summary.get("all_terminal"):
+        return False
+    return grace_period_elapsed(checks_terminal_elapsed)
 
 
 def is_merge_conflicted(pr):
@@ -1506,6 +1550,9 @@ def recommend_actions(
                     actions.append("retry_failed_checks")
             else:
                 actions.append("stop_non_retryable_failure")
+
+    if not actions and is_required_check_missing(checks_summary, checks_terminal_elapsed):
+        actions.append("diagnose_missing_required_checks")
 
     if not actions and is_merge_blocked_without_reason(pr, checks_summary, checks_terminal_elapsed):
         actions.append("diagnose_merge_blocked")
@@ -1712,6 +1759,7 @@ def is_ci_green(snapshot):
     codex_reviewing = bool(codex_gate.get("reviewing"))
     return (
         bool(checks.get("all_terminal"))
+        and has_green_check_set(checks)
         and int(checks.get("failed_count") or 0) == 0
         and int(checks.get("pending_count") or 0) == 0
         and not blocking_review_items
@@ -1800,6 +1848,8 @@ def needs_agent_attention(actions):
 def should_stop_watching(actions):
     action_set = set(actions or [])
     if "diagnose_merge_blocked" in action_set:
+        return True
+    if "diagnose_missing_required_checks" in action_set:
         return True
     if "stop_pr_closed" in action_set:
         return True

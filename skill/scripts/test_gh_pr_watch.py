@@ -1462,6 +1462,53 @@ class MergeBlockedTests(unittest.TestCase):
         self.assertEqual(_actions_for(_open_pr()), ["stop_ready_to_merge"])
 
 
+class RequiredChecksTests(unittest.TestCase):
+    def test_empty_check_set_is_never_ready(self):
+        # Right after a push GitHub may not have registered any check yet.
+        actions = _actions_for(_open_pr(), _green_checks(passed_count=0))
+        self.assertEqual(actions, ["idle"])
+
+    def test_empty_check_set_is_not_reported_as_an_unexplained_block(self):
+        actions = _actions_for(_open_pr(merge_state_status="BLOCKED"), _green_checks(passed_count=0))
+        self.assertEqual(actions, ["idle"])
+
+    def test_empty_check_set_is_not_green_for_backoff(self):
+        snapshot = {
+            "pr": {"review_decision": "APPROVED"},
+            "checks": _green_checks(passed_count=0),
+            "blocking_review_items": [],
+            "checks_terminal_elapsed_seconds": 120,
+        }
+        self.assertFalse(watch.is_ci_green(snapshot))
+
+    def test_summary_lists_required_checks_that_have_not_passed(self):
+        checks = [
+            {"name": "Build", "bucket": "pass", "state": "SUCCESS"},
+            {"name": "third-party", "bucket": "pass", "state": "SUCCESS"},
+        ]
+        with configured({"required_checks": ["build", "lint"]}):
+            summary = watch.summarize_checks(checks)
+        self.assertEqual(summary["required_missing"], ["lint"])
+
+    def test_no_required_checks_by_default(self):
+        with configured():
+            summary = watch.summarize_checks([{"name": "x", "bucket": "pass", "state": "SUCCESS"}])
+        self.assertEqual(summary["required_missing"], [])
+
+    def test_a_lone_third_party_pass_does_not_make_the_pr_ready(self):
+        checks = _green_checks(passed_count=1, required_missing=["lint"])
+        ready = watch.is_pr_ready_to_merge(
+            _open_pr(), checks, new_review_items=[], checks_terminal_elapsed=120, blocking_review_items=[])
+        self.assertFalse(ready)
+
+    def test_missing_required_check_is_diagnosed_after_the_grace_period(self):
+        checks = _green_checks(required_missing=["lint"])
+        self.assertEqual(_actions_for(_open_pr(), checks, checks_terminal_elapsed=10), ["idle"])
+        actions = _actions_for(_open_pr(), checks)
+        self.assertEqual(actions, ["diagnose_missing_required_checks"])
+        self.assertTrue(watch.should_stop_watching(actions))
+
+
 class SessionTimeoutTests(unittest.TestCase):
     def test_once_timeout_keeps_the_actions_of_the_final_snapshot(self):
         actionable = {
