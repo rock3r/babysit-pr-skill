@@ -32,16 +32,18 @@ Clone this repository once, then run `sync.py` with the path of the repository t
 
 ```bash
 git clone https://github.com/rock3r/babysit-pr-skill.git
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.0.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.1.0
 ```
 
 `sync.py` does the following:
 
 1. It copies `skill/` at the given tag into `~/src/my-repo/.agents/skills/babysit-pr/`.
 2. It deletes files in that folder that are no longer part of the skill.
-3. It never changes `config.json`. When there is no `config.json`, it copies `config.example.json` to `config.json`.
+3. It never deletes or changes files that belong to the repository: `config.json`, `skill-source.json`, and every path
+   that matches a glob in `sync.keep` in `config.json`. When there is no `config.json`, it copies
+   `config.example.json` to `config.json`.
 4. It writes the tag and commit SHA to `VERSION`.
-5. It prints every file that it added, updated, or removed.
+5. It prints every file that it added, updated, removed, or kept.
 
 Without `--ref`, it uses the newest `v*` tag. `--dry-run` prints the changes and writes nothing. Review the result,
 edit `config.json` for the repository, and commit the folder.
@@ -50,7 +52,7 @@ edit `config.json` for the repository, and commit the folder.
 
 ```bash
 git -C babysit-pr-skill pull --tags
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.1.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.2.0
 ```
 
 Read [CHANGELOG.md](CHANGELOG.md) for the versions in between. Your `config.json` stays as it is. New config keys
@@ -75,6 +77,7 @@ of the wrong type stops the watcher with an error that names the key.
 | `trusted_author_associations` | list of strings | `["OWNER", "MEMBER", "COLLABORATOR"]` | Comments from these author associations are review items. |
 | `review_bot_login_keywords` | list of strings | `["codex"]` | Comments from `[bot]` accounts whose login contains one of these words are review items. |
 | `max_session_minutes` | integer | `90` | The default for `--max-session-minutes`. |
+| `require_up_to_date` | `"auto"`, `true`, or `false` | `"auto"` | Whether a PR that is behind its base must be updated before merge. `"auto"` reads the base branch's required status checks and rulesets once per run: only a strict (up-to-date) requirement counts. A 403 or 404 answer means not required. Any other failed lookup counts as required. |
 | `codex.enabled` | boolean | `true` | Watch the Codex review bot. When `false`, the watcher makes no Codex calls. |
 | `codex.required` | boolean | `false` | Require a Codex review of the head even on a PR where Codex never posted. |
 | `pr_af.enabled` | boolean | `false` | Watch the label-triggered PR-AF review. When `false`, the watcher makes no PR-AF calls. |
@@ -85,6 +88,10 @@ of the wrong type stops the watcher with an error that names the key.
 | `pr_af.review_author_login` | string | `"github-actions[bot]"` | The login that PR-AF posts as. |
 | `pr_af.missing_check_grace_minutes` | integer | `5` | How long a labelled head waits for its PR-AF check to appear. |
 | `cleanup.branch_delete_requires_approval` | boolean | `false` | Tells the agent to ask the owner before it deletes a merged branch. |
+| `sync.keep` | list of strings | `[]` | Paths in the skill folder that belong to the repository, relative to that folder. Globs work, and `*` also matches `/`. `sync.py` never deletes or overwrites them. The watcher ignores this key. |
+
+`sync.py` always keeps `skill-source.json`, a sidecar file that several repositories keep next to their skills. It
+is a reserved name, like `config.json` and `VERSION`, so it needs no `sync.keep` entry.
 
 Name matching ignores case. For PR-AF names it also ignores extra spaces.
 

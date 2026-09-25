@@ -2,6 +2,33 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 2.1.0
+
+This is a minor release: it adds two config keys and fixes behaviour, and it removes no action or key.
+
+### Added
+
+- `sync.py` keeps files that belong to the repository. It never deletes or overwrites `config.json`, `VERSION` (which
+  it still rewrites), `skill-source.json`, or any path that matches a glob in the new `sync.keep` setting. It lists
+  kept files in its report. An unreadable `config.json` or a bad `sync.keep` stops it before it changes anything.
+  `skill-source.json` is a reserved name, so it is kept without any `sync.keep` entry.
+- `require_up_to_date` (`"auto"`, `true`, or `false`, default `"auto"`) says whether a PR that is behind its base
+  must be updated before merge.
+
+### Fixed
+
+- `BEHIND` blocked every PR that was behind its base, and gave `diagnose_branch_behind`, even when branch protection
+  allows merging an out-of-date branch. With `"auto"`, the watcher now reads the base branch's required status checks
+  and rulesets. Only a strict (up-to-date) requirement makes `BEHIND` block. A 403 or 404 answer means not required,
+  and any other failed lookup counts as required. The snapshot shows the result as `pr.up_to_date_required`.
+- `check_count` counted advisory PR-AF checks and expected skips, which the pass, pending, and fail totals leave out.
+  A PR with only such checks could never be ready, and `diagnose_no_checks` never fired. `check_count` now counts the
+  same checks as the totals.
+- With `codex.required`, a head that Codex has not reviewed while its latest review is of an older commit only got
+  `wait_codex`, so the watch ran into the session timeout on repositories where Codex does not review every push by
+  itself. Once the checks are done and the grace period has passed, the watcher now emits `request_codex_review`.
+  Without `codex.required`, it keeps waiting.
+
 ## 2.0.0
 
 This is a major release because it removes an action and a config key. The README's versioning table counts both
