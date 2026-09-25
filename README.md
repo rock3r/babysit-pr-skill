@@ -32,7 +32,7 @@ Clone this repository once, then run `sync.py` with the path of the repository t
 
 ```bash
 git clone https://github.com/rock3r/babysit-pr-skill.git
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.2.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.2.1
 ```
 
 `sync.py` does the following:

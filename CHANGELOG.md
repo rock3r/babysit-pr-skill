@@ -2,6 +2,17 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 2.2.1
+
+### Fixed
+
+- Codex's "Didn't find any major issues" comment showed up as a new review item and gave `process_review_comment`,
+  although it carries no finding. The watcher now ignores it, like the review summary table. It matches the phrase
+  from the Codex login only, with a straight or a curly apostrophe.
+- When that comment names the head commit (`**Reviewed commit:**`), it counts as a completed Codex review of the head,
+  also on a PR without the summary table. A comment for an older commit proves nothing and does not make Codex count
+  as active.
+
 ## 2.2.0
 
 This is a minor release: it adds the `codex.idle_wait_minutes` config key and fixes behaviour.
