@@ -1344,6 +1344,161 @@ class DraftPrTests(unittest.TestCase):
     def test_non_draft_pr_gets_no_draft_action(self):
         self.assertNotIn("stop_draft_pr", self._actions("CLEAN"))
 
+    def test_green_draft_is_not_reported_as_an_unexplained_block(self):
+        self.assertNotIn("diagnose_merge_blocked", self._actions("DRAFT"))
+
+
+def _green_checks(**overrides):
+    checks = {"all_terminal": True, "failed_count": 0, "pending_count": 0,
+              "passed_count": 2, "skipping_count": 0}
+    checks.update(overrides)
+    return checks
+
+
+def _open_pr(**overrides):
+    pr = {"closed": False, "merged": False, "mergeable": "MERGEABLE",
+          "merge_state_status": "CLEAN", "review_decision": ""}
+    pr.update(overrides)
+    return pr
+
+
+def _actions_for(pr, checks=None, **kwargs):
+    params = {
+        "failed_runs": [], "new_review_items": [], "hung_checks": [], "retries_used": 0,
+        "max_retries": 3, "checks_terminal_elapsed": 120, "blocking_review_items": [],
+        "codex_gate": {"reviewing": False, "status": "idle", "active": True, "head_reviewed": True},
+    }
+    params.update(kwargs)
+    return watch.recommend_actions(pr, checks or _green_checks(), **params)
+
+
+class BranchBehindTests(unittest.TestCase):
+    def test_behind_head_is_not_ready(self):
+        ready = watch.is_pr_ready_to_merge(
+            _open_pr(merge_state_status="BEHIND"), _green_checks(), new_review_items=[],
+            checks_terminal_elapsed=120, blocking_review_items=[],
+        )
+        self.assertFalse(ready)
+
+    def test_behind_branch_is_surfaced_without_a_conflict(self):
+        actions = _actions_for(
+            _open_pr(merge_state_status="BEHIND"),
+            _green_checks(all_terminal=False, pending_count=1),
+            checks_terminal_elapsed=None,
+        )
+        self.assertIn("diagnose_branch_behind", actions)
+        self.assertNotIn("diagnose_merge_conflict", actions)
+
+    def test_green_behind_branch_asks_for_an_update(self):
+        actions = _actions_for(_open_pr(merge_state_status="BEHIND"))
+        self.assertIn("diagnose_branch_behind", actions)
+        self.assertNotIn("stop_ready_to_merge", actions)
+        self.assertTrue(watch.should_stop_watching(actions))
+
+
+class WaitForBotsBeforeBranchUpdateTests(unittest.TestCase):
+    """Updating the branch starts new bot reviews, so let running reviews finish first."""
+
+    def test_conflict_waiting_on_codex_does_not_need_attention(self):
+        self.assertFalse(watch.needs_agent_attention(["diagnose_merge_conflict", "wait_codex"]))
+        self.assertFalse(watch.should_stop_watching(["diagnose_merge_conflict", "wait_codex"]))
+
+    def test_behind_branch_waiting_on_codex_does_not_need_attention(self):
+        self.assertFalse(watch.needs_agent_attention(["diagnose_branch_behind", "wait_codex"]))
+        self.assertFalse(watch.should_stop_watching(["diagnose_branch_behind", "wait_codex"]))
+
+    def test_conflict_and_behind_branch_stop_once_no_bot_is_running(self):
+        self.assertTrue(watch.should_stop_watching(["diagnose_merge_conflict"]))
+        self.assertTrue(watch.should_stop_watching(["diagnose_branch_behind"]))
+
+    def test_bot_wait_does_not_hide_other_actionable_states(self):
+        self.assertTrue(watch.needs_agent_attention(
+            ["diagnose_branch_behind", "wait_codex", "process_review_comment"]))
+        self.assertTrue(watch.needs_agent_attention(
+            ["diagnose_merge_conflict", "wait_codex", "diagnose_ci_failure"]))
+
+
+class MergeBlockedTests(unittest.TestCase):
+    """Green checks with a BLOCKED merge state that no other action explains."""
+
+    def test_unexplained_block_is_a_terminal_diagnose_action(self):
+        actions = _actions_for(_open_pr(merge_state_status="BLOCKED"))
+        self.assertEqual(actions, ["diagnose_merge_blocked"])
+        self.assertTrue(watch.needs_agent_attention(actions))
+        self.assertTrue(watch.should_stop_watching(actions))
+
+    def test_block_waits_out_the_grace_period_first(self):
+        actions = _actions_for(_open_pr(merge_state_status="BLOCKED"), checks_terminal_elapsed=10)
+        self.assertEqual(actions, ["idle"])
+
+    def test_required_review_explains_the_block(self):
+        for decision in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            with self.subTest(decision=decision):
+                actions = _actions_for(_open_pr(merge_state_status="BLOCKED", review_decision=decision))
+                self.assertEqual(actions, ["idle"])
+
+    def test_pending_checks_explain_the_block(self):
+        actions = _actions_for(
+            _open_pr(merge_state_status="BLOCKED"),
+            _green_checks(all_terminal=False, pending_count=1), checks_terminal_elapsed=None,
+        )
+        self.assertEqual(actions, ["idle"])
+
+    def test_running_codex_review_explains_the_block(self):
+        actions = _actions_for(
+            _open_pr(merge_state_status="BLOCKED"),
+            codex_gate={"reviewing": True, "status": "in_progress", "active": True, "head_reviewed": False},
+        )
+        self.assertEqual(actions, ["wait_codex"])
+
+    def test_open_review_items_explain_the_block(self):
+        actions = _actions_for(
+            _open_pr(merge_state_status="BLOCKED"),
+            blocking_review_items=[{"id": "1", "kind": "review_comment"}],
+        )
+        self.assertEqual(actions, ["process_review_comment"])
+
+    def test_clean_pr_is_never_reported_as_blocked(self):
+        self.assertEqual(_actions_for(_open_pr()), ["stop_ready_to_merge"])
+
+
+class SessionTimeoutTests(unittest.TestCase):
+    def test_once_timeout_keeps_the_actions_of_the_final_snapshot(self):
+        actionable = {
+            "pr": {"closed": False, "merged": False},
+            "checks": {"all_terminal": True, "failed_count": 1, "pending_count": 0, "passed_count": 1},
+            "actions": ["diagnose_ci_failure", "stop_non_retryable_failure"],
+        }
+        with patch.object(watch, "collect_snapshot", return_value=(actionable, watch.Path("/tmp/s.json"))), \
+                patch.object(watch.time, "time", side_effect=[0, 61]):
+            result = watch.run_once(SimpleNamespace(
+                pr="auto", repo=None, state_file=None, poll_seconds=30, max_flaky_retries=3,
+                max_session_minutes=1,
+            ))
+
+        self.assertEqual(
+            result["actions"], ["diagnose_ci_failure", "stop_non_retryable_failure", "stop_session_timeout"])
+
+    def test_watch_timeout_includes_the_final_snapshot(self):
+        events = []
+        behind = {
+            "pr": {"closed": False, "merged": False},
+            "checks": {"all_terminal": True, "failed_count": 0, "pending_count": 0, "passed_count": 2},
+            "actions": ["diagnose_branch_behind", "wait_codex"],
+        }
+        with patch.object(watch.time, "time", side_effect=[0, 61]), \
+                patch.object(watch, "collect_snapshot", return_value=(behind, watch.Path("/tmp/s.json"))), \
+                patch.object(watch, "print_event", side_effect=lambda event, payload: events.append((event, payload))):
+            result = watch.run_watch(SimpleNamespace(poll_seconds=30, max_session_minutes=1))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(events), 1)
+        event, payload = events[0]
+        self.assertEqual(event, "stop")
+        self.assertEqual(payload["actions"], ["diagnose_branch_behind", "wait_codex", "stop_session_timeout"])
+        self.assertEqual(payload["snapshot"]["actions"], payload["actions"])
+        self.assertEqual(payload["state_file"], "/tmp/s.json")
+
 
 class SnapshotOrderingTests(unittest.TestCase):
     def test_codex_gate_is_read_before_review_comments(self):

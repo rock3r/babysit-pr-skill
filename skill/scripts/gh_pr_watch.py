@@ -219,6 +219,7 @@ MERGE_BLOCKING_REVIEW_DECISIONS = {
     "CHANGES_REQUESTED",
 }
 MERGE_CONFLICT_OR_BLOCKING_STATES = {
+    "BEHIND",
     "BLOCKED",
     "DIRTY",
     "DRAFT",
@@ -228,6 +229,10 @@ MERGE_CONFLICT_OR_BLOCKING_STATES = {
 # self-resolve by waiting and should be surfaced immediately.
 MERGE_CONFLICT_STATES = {
     "DIRTY",
+}
+# `BEHIND` means branch protection wants the branch updated with its base before merge.
+MERGE_BEHIND_STATES = {
+    "BEHIND",
 }
 GREEN_STATE_MAX_POLL_SECONDS = 60
 
@@ -1293,6 +1298,40 @@ def is_pr_ready_to_merge(
     return True
 
 
+def is_branch_behind(pr):
+    return str(pr.get("merge_state_status") or "") in MERGE_BEHIND_STATES
+
+
+def is_merge_blocked_without_reason(pr, checks_summary, checks_terminal_elapsed):
+    """GitHub says BLOCKED although every check the watcher can see is green.
+
+    Typical causes are a required status check that never reported, a required
+    signature, or a ruleset. None of them resolves by waiting, so the watcher hands
+    the PR to the agent instead of idling until the session timeout. The caller only
+    asks when no other action already explains the state.
+    """
+    if str(pr.get("merge_state_status") or "") != "BLOCKED":
+        return False
+    if str(pr.get("mergeable") or "") == "CONFLICTING":
+        return False
+    # Waiting for a human approval is a normal reason to be blocked.
+    if str(pr.get("review_decision") or "") in MERGE_BLOCKING_REVIEW_DECISIONS:
+        return False
+    if not checks_summary.get("all_terminal"):
+        return False
+    if (
+        int(checks_summary.get("failed_count") or 0) > 0
+        or int(checks_summary.get("pending_count") or 0) > 0
+        or int(checks_summary.get("skipping_count") or 0) > 0
+    ):
+        return False
+    # GitHub can lag behind the checks for a moment. Give it the same grace period
+    # that review bots get.
+    if checks_terminal_elapsed is None or checks_terminal_elapsed < CHECKS_TERMINAL_GRACE_PERIOD_SECONDS:
+        return False
+    return True
+
+
 def is_merge_conflicted(pr):
     mergeable = str(pr.get("mergeable") or "")
     merge_state_status = str(pr.get("merge_state_status") or "")
@@ -1415,6 +1454,9 @@ def recommend_actions(
     if is_merge_conflicted(pr):
         actions.append("diagnose_merge_conflict")
 
+    if is_branch_behind(pr):
+        actions.append("diagnose_branch_behind")
+
     # A draft can never become ready on its own. Once its checks are green, stop and hand it to the
     # owner instead of idling until the session timeout.
     if (
@@ -1464,6 +1506,9 @@ def recommend_actions(
                     actions.append("retry_failed_checks")
             else:
                 actions.append("stop_non_retryable_failure")
+
+    if not actions and is_merge_blocked_without_reason(pr, checks_summary, checks_terminal_elapsed):
+        actions.append("diagnose_merge_blocked")
 
     if not actions:
         actions.append("idle")
@@ -1719,27 +1764,43 @@ def _grace_period_active(snapshot):
 
 # Actions that mean "nothing for the agent to do yet, keep waiting internally".
 # Everything else requires agent attention and should cause --once to return.
-PASSIVE_WAIT_ACTIONS = {
-    "idle",
+# Waits for a review bot that is still working on the current head.
+BOT_WAIT_ACTIONS = {
     "wait_codex",
 }
+PASSIVE_WAIT_ACTIONS = {"idle"} | BOT_WAIT_ACTIONS
+# Actions that ask the agent to update the branch, which starts new bot reviews.
+BRANCH_UPDATE_ACTIONS = {
+    "diagnose_merge_conflict",
+    "diagnose_branch_behind",
+}
+
+
+def waiting_on_review_bot(actions):
+    return bool(set(actions or []) & BOT_WAIT_ACTIONS)
 
 
 def needs_agent_attention(actions):
     """Return True when the actions list contains something the agent should act on.
 
     Used by --once to decide when to stop polling and return to the caller.
-    Returns True for any action that is not a passive wait (idle, wait_codex).
-    An empty actions list also returns True as a safety measure.
+    Returns True for any action that is not a passive wait. A branch update (merge
+    conflict or branch behind) waits while a review bot is still running, so that
+    its findings land in the same fix cycle as the update. An empty actions list
+    also returns True as a safety measure.
     """
     action_set = set(actions or [])
     if not action_set:
         return True
+    if waiting_on_review_bot(action_set) and action_set.issubset(PASSIVE_WAIT_ACTIONS | BRANCH_UPDATE_ACTIONS):
+        return False
     return not action_set.issubset(PASSIVE_WAIT_ACTIONS)
 
 
 def should_stop_watching(actions):
     action_set = set(actions or [])
+    if "diagnose_merge_blocked" in action_set:
+        return True
     if "stop_pr_closed" in action_set:
         return True
     if "stop_exhausted_retries" in action_set:
@@ -1754,9 +1815,16 @@ def should_stop_watching(actions):
         return True
     if "diagnose_skipping_checks" in action_set:
         return True
-    if "diagnose_merge_conflict" in action_set:
+    if action_set & BRANCH_UPDATE_ACTIONS and not waiting_on_review_bot(action_set):
         return True
     return False
+
+
+def with_session_timeout_action(snapshot):
+    """Keep the snapshot's own actions and add stop_session_timeout."""
+    snapshot = dict(snapshot or {})
+    snapshot["actions"] = unique_actions(list(snapshot.get("actions") or []) + ["stop_session_timeout"])
+    return snapshot
 
 
 def run_watch(args):
@@ -1767,10 +1835,18 @@ def run_watch(args):
     while True:
         elapsed = time.time() - watch_started_at
         if elapsed > max_session_seconds:
+            # Report the last known state with the timeout, not the timeout alone.
+            try:
+                snapshot, state_path = collect_snapshot(args)
+            except (GhCommandError, RuntimeError):
+                snapshot, state_path = {"actions": []}, None
+            snapshot = with_session_timeout_action(snapshot)
             print_event(
                 "stop",
                 {
-                    "actions": ["stop_session_timeout"],
+                    "actions": snapshot["actions"],
+                    "snapshot": snapshot,
+                    "state_file": str(state_path) if state_path else None,
                     "elapsed_seconds": int(elapsed),
                     "max_session_seconds": max_session_seconds,
                 },
@@ -1836,9 +1912,8 @@ def run_once(args):
             try:
                 snapshot, state_path = collect_snapshot(args)
             except (GhCommandError, RuntimeError):
-                snapshot = {"actions": ["stop_session_timeout"]}
-                state_path = None
-            snapshot["actions"] = ["stop_session_timeout"]
+                snapshot, state_path = {"actions": []}, None
+            snapshot = with_session_timeout_action(snapshot)
             snapshot["state_file"] = str(state_path) if state_path else None
             return snapshot
 
