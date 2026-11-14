@@ -111,12 +111,13 @@ thread's GraphQL node ID (`PRRT_...`) and resolve it:
 # Reply inside an inline review thread
 gh api repos/{owner}/{repo}/pulls/<n>/comments/<comment-id>/replies --method POST -f body="<triage box + rationale or issue link>"
 
-# Look up review thread node IDs (PRRT_...) and comment databaseIds
-gh api graphql -F owner="{owner}" -F name="{repo}" -F number=<n> -f query='
-  query($owner:String!, $name:String!, $number:Int!) {
+# Look up review thread node IDs (PRRT_...) and comment databaseIds across all pages
+gh api graphql --paginate -F owner="{owner}" -F name="{repo}" -F number=<n> -f query='
+  query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
     repository(owner:$owner, name:$name) {
       pullRequest(number:$number) {
-        reviewThreads(first:100) {
+        reviewThreads(first:100, after:$endCursor) {
+          pageInfo { hasNextPage endCursor }
           nodes { id isResolved comments(first:10) { nodes { databaseId } } }
         }
       }
