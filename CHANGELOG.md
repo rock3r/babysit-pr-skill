@@ -2,6 +2,17 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 2.3.0
+
+### Changed
+
+- Put `skill/SKILL.md` and `skill/references/` on a skill diet (`SKILL.md` trimmed from 3,077 to ~1,300 words and 272
+  to 132 lines), moving the `config.json` key table and diagnostic playbooks for uncommon actions to
+  `skill/references/actions-and-config.md` and adding concrete inline reply + GraphQL `resolveReviewThread` examples to
+  `skill/references/github-api-notes.md`.
+- Added frontmatter `metadata.version` (`2.3.0`) and `skill/evals/evals.json` (12 behavioural evaluation scenarios),
+  plus `RealSkillTests` parity checks in `tests/test_sync.py`.
+
 ## 2.2.2
 
 ### Fixed

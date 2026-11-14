@@ -101,6 +101,37 @@ With PR-AF enabled, the watcher also reads the last 20 label and unlabel events 
 (`pullRequest.timelineItems`). It uses them to notice that the PR-AF label was removed and added again on the same
 head.
 
+### Replying in-thread and resolving inline review threads
+
+`gh pr comment` posts a top-level PR issue comment, which does not reply inside an inline review thread. Reply to the
+root inline comment's numeric REST `id` (`new_review_items[].id` / `blocking_review_items[].id`), then look up the
+thread's GraphQL node ID (`PRRT_...`) and resolve it:
+
+```bash
+# Reply inside an inline review thread
+gh api repos/{owner}/{repo}/pulls/<n>/comments/<comment-id>/replies --method POST -f body="<triage box + rationale or issue link>"
+
+# Look up review thread node IDs (PRRT_...) and comment databaseIds
+gh api graphql -F owner="{owner}" -F name="{repo}" -F number=<n> -f query='
+  query($owner:String!, $name:String!, $number:Int!) {
+    repository(owner:$owner, name:$name) {
+      pullRequest(number:$number) {
+        reviewThreads(first:100) {
+          nodes { id isResolved comments(first:10) { nodes { databaseId } } }
+        }
+      }
+    }
+  }'
+
+# Resolve a review thread by its GraphQL node ID
+gh api graphql -F threadId="<PRRT_...>" -f query='
+  mutation($threadId:ID!) {
+    resolveReviewThread(input:{threadId:$threadId}) {
+      thread { id isResolved }
+    }
+  }'
+```
+
 ## JSON fields the watcher reads
 
 ### `gh pr view`

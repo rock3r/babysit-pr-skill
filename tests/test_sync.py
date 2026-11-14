@@ -315,6 +315,35 @@ class RealSkillTests(unittest.TestCase):
         self.assertTrue((scripts / "gh_pr_watch.py").exists())
         self.assertTrue((scripts / "test_gh_pr_watch.py").exists())
 
+    def test_skill_references_match_skill_md_links(self):
+        import re
+
+        skill = REPO_ROOT / "skill"
+        skill_md = (skill / "SKILL.md").read_text(encoding="utf-8")
+        linked = set(re.findall(r"\((references/[A-Za-z0-9._-]+\.md)\)", skill_md))
+        actual = {
+            f"references/{path.name}"
+            for path in (skill / "references").glob("*.md")
+        }
+        self.assertEqual(linked, actual)
+
+    def test_skill_evals_json_is_valid_and_single_line(self):
+        evals_path = REPO_ROOT / "skill" / "evals" / "evals.json"
+        self.assertTrue(evals_path.exists())
+        payload = json.loads(evals_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("skill_name"), "babysit-pr")
+        cases = payload.get("evals")
+        self.assertIsInstance(cases, list)
+        self.assertGreaterEqual(len(cases), 12)
+        for case in cases:
+            prompt = case.get("prompt")
+            self.assertIsInstance(prompt, str)
+            self.assertTrue(prompt.strip())
+            self.assertNotIn("\n", prompt)
+            assertions = case.get("assertions")
+            self.assertIsInstance(assertions, list)
+            self.assertTrue(assertions)
+
 
 if __name__ == "__main__":
     unittest.main()

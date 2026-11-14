@@ -15,7 +15,8 @@ This repository holds the one maintained copy of the skill. Other repositories v
 | `skill/SKILL.md` | The instructions for the agent. |
 | `skill/scripts/gh_pr_watch.py` | The watcher. Python 3.9 or newer, standard library only. |
 | `skill/scripts/test_gh_pr_watch.py` | The watcher's tests. They travel with the skill, so repositories can run them in their own CI. |
-| `skill/references/` | Failure heuristics and notes on the GitHub calls that the watcher makes. |
+| `skill/references/` | Config reference, action playbooks, failure heuristics, and GitHub CLI/API notes. |
+| `skill/evals/evals.json` | Behavioural evaluation prompts and assertions for the skill instructions. |
 | `skill/config.example.json` | The default config. `sync.py` copies it to `config.json` on the first sync. |
 | `sync.py` | Copies a pinned version of `skill/` into a repository. |
 | `tests/` | Tests for `sync.py`. |
@@ -32,7 +33,7 @@ Clone this repository once, then run `sync.py` with the path of the repository t
 
 ```bash
 git clone https://github.com/rock3r/babysit-pr-skill.git
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.2.1
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.3.0
 ```
 
 `sync.py` does the following:

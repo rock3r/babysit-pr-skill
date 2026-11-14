@@ -1,0 +1,134 @@
+{
+  "skill_name": "babysit-pr",
+  "evals": [
+    {
+      "id": 0,
+      "name": "choose-watcher-mode-and-json-path",
+      "prompt": "I opened PR #412 on this repo and want you to babysit it in a standard command-execution harness that only returns command output after a process exits. Which gh_pr_watch.py flag should you loop on, why shouldn't you use --watch or --snapshot for the main wait, and where do you read the recommended actions in each mode (including --retry-failed-now)?",
+      "assertions": [
+        "Selects --once (default blocking poll) as the main loop mode for harnesses that return output only on command exit",
+        "Explains that --watch streams JSONL events for harnesses reading live output and --snapshot returns immediately without waiting",
+        "Reads top-level actions for --once and --snapshot",
+        "Reads snapshot.actions (with top-level rerun_attempted, rerun_count, reason) for --retry-failed-now",
+        "Reads payload.snapshot.actions on snapshot events and payload.actions on stop events for --watch"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "retry-flaky-e2e-vs-diagnose-unit-failure",
+      "prompt": "gh_pr_watch.py --pr 412 --once just returned failed_runs showing two failures on head abc1234: `e2e-desktop` (retry_eligible: true, timed out talking to staging) and `jvm-unit-tests` (retry_eligible: false, compile error in a file my PR touched). Should I run --retry-failed-now right away?",
+      "assertions": [
+        "Says NOT to run --retry-failed-now while a non-retryable branch-caused failure exists",
+        "Diagnoses jvm-unit-tests as branch-caused and starts fixing it locally rather than rerunning CI",
+        "Notes that --retry-failed-now only reruns workflows matching retry_eligible_workflow_keywords when all failures are retry-eligible and checks are terminal",
+        "Mentions the per-head-SHA retry budget (3 by default, surfacing stop_exhausted_retries when exhausted) and that pushing a fix commit resets the head SHA"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "codex-eyes-reaction-and-idle-wait-expired",
+      "prompt": "How does babysit-pr track Codex reviews when Codex has no GitHub check run? Specifically: what happens right after a push when there is no 👀 reaction yet, what should I do if gh_pr_watch.py returns request_codex_review vs stop_ready_to_merge with codex_gate.idle_wait_expired: true, and do I need to resolve Codex's `Didn't find any major issues` comment?",
+      "assertions": [
+        "Explains that chatgpt-codex-connector[bot] signals an active review via a 👀 reaction on the PR plus the Codex Review Summary comment for the current head SHA",
+        "States that an absent 👀 reaction right after push is not enough when Codex is active on the PR — the watcher waits for a Completed review of head_sha or idle_wait_minutes",
+        "Comments `@codex review` on the PR when request_codex_review (or a failed review under diagnose_codex_review) is returned",
+        "Tells the PR owner that Codex did not review the current head (surfacing codex_gate.note) when stop_ready_to_merge arrives with codex_gate.idle_wait_expired: true",
+        "Treats Codex's `Didn't find any major issues` comment and summary table as status/clean completion rather than actionable review items"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "pr-af-advisory-check-blocking-comments",
+      "prompt": "Our repo has pr_af.enabled set to true with label `pr-af`. On PR #518 the `PR-AF Review` GitHub Actions job failed with exit code 1, and `github-actions[bot]` also posted an inline comment containing the configured pr_af.review_body_markers text. Does the failed PR-AF check block merge, does the comment block merge, and should I add `github-actions` to review_bot_login_keywords?",
+      "assertions": [
+        "Explains that the PR-AF check itself is advisory: while running (or within missing_check_grace_minutes) it holds readiness with wait_pr_af, but a failed, skipped, cancelled, or hung PR-AF check never counts as a CI failure",
+        "States that marked PR-AF review comments ARE blocking review items that must be triaged and resolved before merge",
+        "Explicitly warns NEVER to add the shared github-actions[bot] login to review_bot_login_keywords"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "push-once-batching-with-local-gate",
+      "prompt": "While babysitting PR #601, the `lint` workflow failed on a formatting violation I introduced, `unit-tests` is still running, and Codex still has its 👀 reaction on the PR. I already fixed the lint issue in 30 seconds. Should I commit and push right now so CI restarts faster?",
+      "assertions": [
+        "Says NOT to push yet because every push restarts CI and triggers a new round of bot reviews",
+        "Approves fixing the branch-caused failure locally right away without waiting idle",
+        "Requires waiting until running checks and review bots (including Codex's 👀 review) finish so any additional findings fold into the same batch",
+        "Requires running the configured local_gate (or repo check command when local_gate is null) green before pushing once"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "triage-2x2-matrix-and-loop-breakers",
+      "prompt": "Rounds 1 and 2 of bot reviews on my small null-handling fix PR only had minor style suggestions (no blockers). Now on round 3, a bot flagged two items: (1) a real pre-existing race condition in an untouched class on main that would cause data loss under load, and (2) another round of stricter input validation on a helper I only added in round 1 and already tweaked in round 2 for that same bot. How should I triage both findings, and should I keep going for round 4?",
+      "assertions": [
+        "Applies the 2x2 triage matrix (In scope vs Out of scope x Blocker vs Improvement) and names the box in the reply",
+        "Classifies (1) as Out of scope + Blocker because the defect already exists on the base branch without this PR, filing an issue and linking it on the PR rather than expanding scope",
+        "Recognizes (2) as an Improvement and triggers the loop-breaker rule (three rounds without an in-scope blocker, or twice in a row on code added only for an earlier finding)",
+        "Stops and asks the owner with concrete diff stats (commits, files, lines), saving any out-of-scope work on a followup/<topic> branch before reverting"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "inline-reply-and-graphql-thread-resolution",
+      "prompt": "gh_pr_watch.py shows `blocking_review_items` has two unresolved inline threads: one from `chatgpt-codex-connector[bot]` (comment id 1987654321) that is out of scope so I filed issue #902 and made no code change, and one open inline note I posted myself earlier. Give me the exact steps and gh API calls so blocking_review_items clears.",
+      "assertions": [
+        "Explains that blocking_review_items blocks readiness until empty, including open inline threads started by the authenticated account",
+        "Replies in-thread using REST POST repos/{owner}/{repo}/pulls/<pr>/comments/<comment-id>/replies (not gh pr comment, which posts a top-level PR comment) with the triage rationale and issue link before resolving an unchanged bot finding",
+        "Queries reviewThreads via GraphQL to find the thread node IDs (PRRT_...) and resolves both threads via the GraphQL resolveReviewThread mutation"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "update-behind-or-conflicting-branch-via-merge",
+      "prompt": "gh_pr_watch.py returned `diagnose_branch_behind` on PR #710, which comes from a contributor fork targeting upstream's `release/2.4` branch. Should I run `git fetch origin main && git rebase origin/main && git push --force`?",
+      "assertions": [
+        "Rejects assuming `main`, using `origin` blindly on a fork, rebasing unasked, and using plain `git push --force`",
+        "Checks the actual base branch via `gh pr view <n> --json baseRefName` (`release/2.4`) and fetches from the target upstream repository remote rather than the fork's `origin`",
+        "Merges the updated base branch into the PR branch (preserving history so a normal push suffices) unless the owner explicitly asked to rebase (which would use --force-with-lease)",
+        "Verifies no review bot is running, runs local_gate, verifies earlier fixes remain intact, and pushes once"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "stop-ready-to-merge-sole-authority",
+      "prompt": "gh_pr_watch.py exited with an error because .agents/skills/babysit-pr/config.json had a string instead of a list for required_checks, so I ran `gh pr checks 77` directly — it printed `no checks reported`, and `gh pr view 77` shows `MERGEABLE`. Can I tell the user PR #77 is green and merge it now?",
+      "assertions": [
+        "Refuses to declare the PR ready or merge based on raw `gh pr checks` or `gh pr view` output",
+        "States that gh_pr_watch.py (`stop_ready_to_merge`) is the sole authority on merge readiness and a broken watcher/config must be reported or fixed as a tooling/config error rather than bypassed with ad-hoc polling",
+        "Points out that zero checks (`no checks reported` / `check_count == 0`) is NEVER ready and maps to `diagnose_no_checks`"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "post-merge-cleanup-merged-vs-closed",
+      "prompt": "gh_pr_watch.py just exited with `stop_pr_closed` for PR #815 (`feature/cache` checked out in `.worktrees/feature-cache`), and config.json has `cleanup.branch_delete_requires_approval: true`. Walk me through the exact checks and cleanup commands I must run — both if it was closed unmerged and if it was squash-merged.",
+      "assertions": [
+        "Checks `pr.merged` in the snapshot or `gh pr view 815 --json mergedAt` first: if closed without merging, keeps the worktree and branch untouched and reports to the owner",
+        "Runs all cleanup commands from the main checkout (never from inside `.worktrees/feature-cache`) and never deletes remote branches",
+        "Removes the linked worktree first via `git worktree remove` without `--force` (stopping if dirty)",
+        "Asks the owner for approval before deleting the local branch because `cleanup.branch_delete_requires_approval` is `true`",
+        "Verifies `git rev-parse feature/cache` equals the merged PR's `headRefOid` before running `git branch -D feature/cache`, then runs `git pull --ff-only` on the base branch"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "diagnose-merge-blocked-and-missing-required-checks",
+      "prompt": "All reported checks on PR #880 passed, there are no unresolved threads or conflicts, yet gh_pr_watch.py returned `diagnose_merge_blocked`. On another PR #881 it returned `diagnose_missing_required_checks` with `checks.required_missing: [\"check\"]`. How do I handle each?",
+      "assertions": [
+        "For `diagnose_merge_blocked`, inspects branch protection / rulesets via `gh api repos/{owner}/{repo}/rules/branches/<base>` for required code-owner reviews, required commit signatures, or unreported status checks, reports the blocker to the owner, and never bypasses it",
+        "For `diagnose_missing_required_checks`, investigates why the check in `checks.required_missing` did not run (such as path/branch filters, disabled workflows, or non-PR triggers) and reports findings to the owner"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "preflight-wrong-checkout-and-dirty-worktree",
+      "prompt": "You were asked to babysit PR #905 (`fix/auth-timeout`, head SHA `9f8e7d6`). You run a snapshot and find a branch-caused test failure to fix, but your current shell is on `main` with uncommitted edits in two unrelated files. What do you do before touching any code?",
+      "assertions": [
+        "Catches the preflight invariant that `HEAD` must match the PR's `head_branch` (`fix/auth-timeout`) at `head_sha` (`9f8e7d6`) before editing",
+        "Does NOT edit on `main` and does NOT stash/reset/overwrite the unrelated uncommitted changes",
+        "Checks out the PR branch in its own isolated git worktree (or stops and asks the owner when unrelated uncommitted changes make safe work uncertain)"
+      ]
+    }
+  ]
+}
