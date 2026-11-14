@@ -2,6 +2,20 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 2.2.2
+
+### Fixed
+
+- Codex can finish reviewing a commit (removing its 👀 reaction and adding 👍 on the PR) while leaving its review
+  summary row or embedded `<!-- codex-review-state:v1 ... -->` comment stuck on `Running`. The watcher now parses
+  `codex-review-state:v1` markers, ignores them as status-only bot comments, and stops waiting forever when `Running` is
+  left behind without 👀:
+  - without `codex.required`, it expires after the 60-second grace period when Codex added a 👍 reaction strictly after
+    posting/editing the `Running` summary, or after `codex.idle_wait_minutes` without 👍, setting
+    `codex_gate.idle_wait_expired` and `codex_gate.note`;
+  - with `codex.required`, it sets `codex_gate.stale_running` after `codex.idle_wait_minutes` without 👀 so
+    `diagnose_codex_review` wakes `--once` instead of hanging until session timeout, while keeping readiness false.
+
 ## 2.2.1
 
 ### Fixed

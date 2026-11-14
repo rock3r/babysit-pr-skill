@@ -48,7 +48,7 @@ stops the watcher with an error that names the key.
 | `require_up_to_date` | `"auto"` | Whether a branch that is behind its base must be updated before merge. `"auto"` reads the base branch's protection and rulesets, and counts any answer it cannot be sure of (such as a 403) as "required". `true` or `false` skips that lookup: set `false` when you know the base has no strict rule. |
 | `codex.enabled` | `true` | Watch the Codex review bot. |
 | `codex.required` | `false` | Require a Codex review of the head, even on a PR where Codex never posted. |
-| `codex.idle_wait_minutes` | `10` | Without `codex.required`: how long to wait after the checks finish for Codex to start reviewing the head. After that, the missing review no longer blocks. |
+| `codex.idle_wait_minutes` | `10` | Without `codex.required`: how long to wait after the checks finish for Codex to start reviewing the head or edit a stuck `Running` summary with no 👀 reaction. After that, the missing or stuck review no longer blocks. |
 | `pr_af.enabled` | `false` | Watch the label-triggered PR-AF review. The other `pr_af` keys describe it. |
 | `pr_af.label` | `"pr-af"` | The PR label that asks for a PR-AF review. |
 | `pr_af.workflow_names`, `pr_af.check_names` | `[]` | The names of the PR-AF workflow and check. A name matches either list. |
@@ -117,7 +117,7 @@ again.
 | `process_review_comment` | There are new or unresolved review items. Triage them. | yes | no |
 | `diagnose_ci_failure` | A check failed. Classify it before you act. | yes | no |
 | `retry_failed_checks` | Only retry-eligible workflows failed. Rerun them with `--retry-failed-now`. | yes | no |
-| `diagnose_codex_review` | Codex reports a failed or unknown review status for the head. | yes | no |
+| `diagnose_codex_review` | Codex reports a failed or unknown review status for the head, or `codex.required` is `true` and its summary stayed on `Running` with no 👀 reaction past `codex.idle_wait_minutes`. | yes | no |
 | `request_codex_review` | Codex is required but has not reviewed the head: it never posted on the PR, or its latest review is of an older commit. Comment `@codex review` on the PR. | yes | no |
 | `diagnose_merge_conflict` | The PR is `CONFLICTING` or `DIRTY`. It waits while a review bot runs. | yes | yes |
 | `diagnose_branch_behind` | The branch is behind its base, and the base requires up-to-date branches. It waits while a review bot runs. | yes | yes |
@@ -143,8 +143,8 @@ What to do for the less obvious ones:
   owner. A PR without checks is never reported as ready.
 - `diagnose_missing_required_checks`: find out why the check did not run. Common causes are path filters, a
   disabled workflow, or a trigger that does not fire on PRs.
-- `diagnose_codex_review`: read the Codex summary comment on the PR. If the review failed, ask again with
-  `@codex review`. If it fails again, tell the owner.
+- `diagnose_codex_review`: read the Codex summary comment on the PR. If the review failed or stayed stuck on `Running`
+  with no 👀 reaction, ask again with `@codex review`. If it fails again, tell the owner.
 - `diagnose_hung_check` and `diagnose_skipping_checks`: look at the run with `gh run view`. Report what you find.
 
 `references/heuristics.md` lists how to tell a branch-caused failure from a flaky one, and when to stop and ask.
@@ -165,8 +165,12 @@ table does not have Codex active, so this check does not apply, unless `codex.re
 `codex.required`, the watcher asks for a review (`request_codex_review`) once the checks are done and the grace period
 has passed, when Codex is idle and has not reviewed the head. Without `codex.required`, the watcher waits
 `codex.idle_wait_minutes` for Codex to start. After that, the missing review no longer blocks, and
-`codex_gate.idle_wait_expired` and `codex_gate.note` say that Codex did not review the head. A running review (a 👀
-reaction, or a "Running" row for the head) always blocks. When Codex finds nothing, it posts a "Didn't find any major issues" comment with the reviewed commit. That comment
+`codex_gate.idle_wait_expired` and `codex_gate.note` say that Codex did not review the head. A 👀 reaction always
+blocks. A `Running` summary row (or embedded `codex-review-state:v1` marker) for the head also blocks while 👀 is
+present; if 👀 is gone and Codex never edits the summary away from `Running`, optional mode expires after the 60-second
+grace period when Codex added a 👍 reaction after posting `Running` (or after `codex.idle_wait_minutes` without 👍),
+while `codex.required` sets `codex_gate.stale_running` and emits `diagnose_codex_review`. When Codex finds nothing, it
+posts a "Didn't find any major issues" comment with the reviewed commit. That comment
 is a result, not a finding, so it is never a review item. When its commit is the head, it also counts as a completed
 review of the head. The table is a status, not a finding, so the watcher never reports it as a review item. When the reactions cannot be read, the
 gate stays closed.

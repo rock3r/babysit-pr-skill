@@ -73,7 +73,7 @@ nothing. A 403, any other 404, and every other failure count as "required", and 
 ## Review endpoints
 
 ```bash
-# Issue comments on the PR, including the Codex review summary
+# Issue comments on the PR, including the Codex review summary and codex-review-state:v1 metadata
 gh api "repos/{owner}/{repo}/issues/<n>/comments?per_page=100&page=<p>"
 
 # Inline review comments
@@ -82,12 +82,16 @@ gh api "repos/{owner}/{repo}/pulls/<n>/comments?per_page=100&page=<p>"
 # Review submissions. When this call fails, the watcher lists reviews through GraphQL instead.
 gh api "repos/{owner}/{repo}/pulls/<n>/reviews?per_page=100&page=<p>"
 
-# Reactions on the PR (the Codex 👀 reaction), all pages
+# Reactions on the PR (Codex 👀 in-progress and 👍 clean-completion reactions), all pages
 gh api "repos/{owner}/{repo}/issues/<n>/reactions?per_page=100&page=<p>"
 
 # The authenticated login, so the watcher can skip its own comments
 gh api user
 ```
+
+For Codex summary comments, the watcher reads both the Markdown status table and any embedded
+`<!-- codex-review-state:v1 {...} -->` JSON block, plus `updated_at` (falling back to `created_at`) and reaction
+`created_at` timestamps so an unedited `Running` summary can be distinguished from an older commit's `👍` reaction.
 
 The watcher reads unresolved review threads through GraphQL (`pullRequest.reviewThreads`, 100 threads per page,
 100 comments per thread). A GraphQL response with `errors` or without data is a failed lookup, never "no open

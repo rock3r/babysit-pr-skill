@@ -2374,6 +2374,310 @@ class CodexIdleWaitTests(unittest.TestCase):
         self.assertTrue(snapshot["codex_gate"]["idle_wait_expired"])
 
 
+class CodexStaleRunningTests(unittest.TestCase):
+    """Codex can remove 👀 and add 👍 while leaving its summary comment stuck on Running."""
+
+    HEAD = "13483b99741250e7df035f761a4b44e680e93398"
+
+    @classmethod
+    def _state_v1_comment(
+        cls,
+        status="running",
+        sha=None,
+        created_at="2026-11-14T04:10:37Z",
+        updated_at=None,
+        include_table=True,
+    ):
+        commit_sha = sha or cls.HEAD
+        state_json = json.dumps(
+            {
+                "code_review": {
+                    "commit_sha": commit_sha,
+                    "has_any_findings": None if status == "running" else False,
+                    "has_unresolved_findings": None if status == "running" else False,
+                    "status": status,
+                },
+                "security_review": {
+                    "commit_sha": None,
+                    "has_any_findings": None,
+                    "has_unresolved_findings": None,
+                    "status": None,
+                },
+            }
+        )
+        body_parts = [f"<!-- codex-review-state:v1 {state_json} -->"]
+        if include_table:
+            label = "🔄 **Running**" if status == "running" else "✅ **Completed**"
+            body_parts.insert(0, "<!-- codex-pull-request-review-summary -->")
+            body_parts.append(
+                "| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n"
+                f"| 📝 **Code Review** | {label} | `{commit_sha[:7]}` | PR opened |"
+            )
+        return {
+            "id": 6871485122,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "author_association": "NONE",
+            "created_at": created_at,
+            "updated_at": updated_at or created_at,
+            "body": "\n\n".join(body_parts),
+            "html_url": "https://example.invalid/codex-summary",
+        }
+
+    @staticmethod
+    def _reaction(content, created_at, login="chatgpt-codex-connector[bot]"):
+        return {
+            "content": content,
+            "created_at": created_at,
+            "user": {"login": login},
+        }
+
+    def test_parses_codex_review_state_v1_comment_and_ignores_it_as_a_review_item(self):
+        running_only_v1 = self._state_v1_comment(status="running", include_table=False)
+        completed_only_v1 = self._state_v1_comment(status="completed", include_table=False)
+
+        self.assertEqual(
+            watch.summarize_codex_head_review([running_only_v1], self.HEAD),
+            {"active": True, "head_reviewed": False, "head_status": "running"},
+        )
+        self.assertEqual(
+            watch.summarize_codex_head_review([completed_only_v1], self.HEAD),
+            {"active": True, "head_reviewed": True, "head_status": "completed"},
+        )
+        self.assertFalse(
+            watch.is_actionable_review_bot_item(
+                {
+                    "kind": "issue_comment",
+                    "author": "chatgpt-codex-connector[bot]",
+                    "body": running_only_v1["body"],
+                }
+            )
+        )
+
+    def test_ignores_malformed_codex_review_state_v1_payloads(self):
+        malformed_only = {
+            "id": 911,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "created_at": "2026-11-14T04:10:37Z",
+            "updated_at": "2026-11-14T04:10:37Z",
+            "body": (
+                "<!-- codex-review-state:v1 {not-json -->\n"
+                '<!-- codex-review-state:v1 {"code_review":"wrong"} -->'
+            ),
+        }
+        malformed_plus_valid = {
+            **malformed_only,
+            "body": (
+                malformed_only["body"]
+                + f'\n<!-- codex-review-state:v1 {{"code_review":{{"commit_sha":"{self.HEAD}","status":"completed"}}}} -->'
+            ),
+        }
+        self.assertEqual(
+            watch.summarize_codex_head_review([malformed_only], self.HEAD),
+            {"active": True, "head_reviewed": False, "head_status": "none"},
+        )
+        self.assertEqual(
+            watch.summarize_codex_head_review([malformed_plus_valid], self.HEAD),
+            {"active": True, "head_reviewed": True, "head_status": "completed"},
+        )
+
+    def test_fresh_running_summary_with_post_summary_thumbs_up_still_waits_during_grace(self):
+        pr = {"repo": "owner/repo", "number": 42, "head_sha": self.HEAD}
+        comments = [self._state_v1_comment(status="running", created_at="2026-11-14T04:10:37Z")]
+        reactions = [self._reaction("+1", "2026-11-14T04:11:22Z")]
+        with patch.object(watch, "get_pr_issue_reactions", return_value=reactions), \
+                patch.object(watch, "gh_api_list_paginated", return_value=comments):
+            gate = watch.collect_codex_gate(pr)
+
+        self.assertTrue(gate.get("thumbs_up_after_running"))
+        # At t = 0 (unwatched for 0s) or within the 60s grace period, keep waiting.
+        at_zero = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 120, running_idle_elapsed=0)
+        self.assertFalse(at_zero.get("idle_wait_expired"))
+        self.assertEqual(_actions_for(_open_pr(), codex_gate=at_zero), ["wait_codex"])
+
+        in_grace = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 30, running_idle_elapsed=90)
+        self.assertFalse(in_grace.get("idle_wait_expired"))
+        self.assertEqual(
+            _actions_for(_open_pr(), codex_gate=in_grace, checks_terminal_elapsed=30),
+            ["wait_codex"],
+        )
+
+    def test_old_thumbs_up_from_earlier_commit_does_not_fast_expire_running_head(self):
+        # Commit 1 created the summary at 04:00:00Z and earned a 👍 at 04:01:00Z.
+        # Commit 2 edited the summary to Running at 04:20:00Z, so that 👍 is older than updated_at.
+        pr = {"repo": "owner/repo", "number": 42, "head_sha": self.HEAD}
+        comments = [
+            self._state_v1_comment(
+                status="running",
+                created_at="2026-11-14T04:00:00Z",
+                updated_at="2026-11-14T04:20:00Z",
+            )
+        ]
+        reactions = [self._reaction("+1", "2026-11-14T04:01:00Z")]
+        with patch.object(watch, "get_pr_issue_reactions", return_value=reactions), \
+                patch.object(watch, "gh_api_list_paginated", return_value=comments):
+            gate = watch.collect_codex_gate(pr)
+
+        self.assertFalse(gate.get("thumbs_up_after_running"))
+        applied = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 120, running_idle_elapsed=120)
+        self.assertFalse(applied.get("idle_wait_expired"))
+        self.assertEqual(_actions_for(_open_pr(), codex_gate=applied), ["wait_codex"])
+
+    def test_post_summary_thumbs_up_expires_dropped_summary_edit_after_grace_when_optional(self):
+        pr = {"repo": "owner/repo", "number": 42, "head_sha": self.HEAD}
+        comments = [self._state_v1_comment(status="running", created_at="2026-11-14T04:10:37Z")]
+        reactions = [self._reaction("+1", "2026-11-14T04:11:22Z")]
+        with patch.object(watch, "get_pr_issue_reactions", return_value=reactions), \
+                patch.object(watch, "gh_api_list_paginated", return_value=comments):
+            gate = watch.collect_codex_gate(pr)
+
+        with configured():
+            applied = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 60, running_idle_elapsed=60)
+            actions = _actions_for(_open_pr(), codex_gate=applied, checks_terminal_elapsed=60)
+
+        self.assertTrue(applied["idle_wait_expired"])
+        self.assertIn("Running", applied["note"])
+        self.assertEqual(actions, ["stop_ready_to_merge"])
+
+    def test_unwatched_running_summary_without_thumbs_up_expires_after_idle_wait_when_optional(self):
+        gate = {
+            "reviewing": False,
+            "status": "idle",
+            "active": True,
+            "head_reviewed": False,
+            "head_status": "running",
+        }
+        with configured():
+            before = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 10 * 60, running_idle_elapsed=9 * 60)
+            after = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 10 * 60, running_idle_elapsed=10 * 60)
+
+        self.assertFalse(before.get("idle_wait_expired"))
+        self.assertEqual(_actions_for(_open_pr(), codex_gate=before, checks_terminal_elapsed=10 * 60), ["wait_codex"])
+        self.assertTrue(after["idle_wait_expired"])
+        self.assertIn("Running", after["note"])
+        self.assertEqual(
+            _actions_for(_open_pr(), codex_gate=after, checks_terminal_elapsed=10 * 60),
+            ["stop_ready_to_merge"],
+        )
+
+    def test_long_review_with_eyes_does_not_expire_the_moment_eyes_is_removed(self):
+        # Codex reviews for 11 minutes with 👀 on the PR, then removes 👀 right before posting findings.
+        pr = {
+            "repo": "owner/repo",
+            "number": 42,
+            "head_sha": self.HEAD,
+            "labels": [],
+            "base_branch": "main",
+            "closed": False,
+            "merged": False,
+            "mergeable": "MERGEABLE",
+            "merge_state_status": "CLEAN",
+            "review_decision": "",
+        }
+        start_ts = watch.parse_github_time_seconds("2026-11-14T04:00:00Z")
+        clock = [start_ts]
+        comments = [self._state_v1_comment(status="running", created_at="2026-11-14T04:00:00Z")]
+        reactions_by_poll = [
+            [self._reaction("eyes", "2026-11-14T04:00:02Z")],
+            [],
+            [],
+        ]
+        args = SimpleNamespace(pr="42", repo=None, state_file=None, max_flaky_retries=3)
+
+        with tempfile.TemporaryDirectory() as tmp, configured():
+            state_path = watch.Path(tmp) / "s.json"
+            with patch.object(watch, "resolve_pr", return_value=pr), \
+                    patch.object(watch, "default_state_file_for", return_value=state_path), \
+                    patch.object(watch, "get_pr_checks", return_value=[_ci_pass()]), \
+                    patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                    patch.object(watch, "get_pr_issue_reactions", side_effect=reactions_by_poll), \
+                    patch.object(watch, "gh_api_list_paginated", return_value=comments), \
+                    patch.object(watch, "fetch_new_review_items", return_value=([], [])), \
+                    patch.object(watch.time, "time", side_effect=lambda: clock[0]):
+                first, _ = watch.collect_snapshot(args)
+                clock[0] = start_ts + 11 * 60
+                second, _ = watch.collect_snapshot(args)
+                clock[0] = start_ts + 21 * 60
+                third, _ = watch.collect_snapshot(args)
+
+        self.assertEqual(first["actions"], ["wait_codex"])
+        # Poll 2 is 11m after checks finished, but 0s after 👀 disappeared: must still wait!
+        self.assertEqual(second["actions"], ["wait_codex"])
+        self.assertFalse(second["codex_gate"].get("idle_wait_expired"))
+        # Poll 3 is 10m after 👀 disappeared with Summary still on Running: now expired!
+        self.assertEqual(third["actions"], ["stop_ready_to_merge"])
+        self.assertTrue(third["codex_gate"]["idle_wait_expired"])
+
+    def test_required_codex_diagnoses_stale_running_instead_of_hanging_or_merging(self):
+        gate = {
+            "reviewing": False,
+            "status": "idle",
+            "active": True,
+            "head_reviewed": False,
+            "head_status": "running",
+        }
+        with configured({"codex": {"required": True}}):
+            before = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 10 * 60, running_idle_elapsed=9 * 60)
+            after = watch.apply_codex_idle_wait(dict(gate), _green_checks(), 10 * 60, running_idle_elapsed=10 * 60)
+            before_actions = _actions_for(_open_pr(), codex_gate=before, checks_terminal_elapsed=10 * 60)
+            after_actions = _actions_for(_open_pr(), codex_gate=after, checks_terminal_elapsed=10 * 60)
+
+        self.assertEqual(before_actions, ["wait_codex"])
+        self.assertFalse(after.get("idle_wait_expired"))
+        self.assertTrue(after.get("stale_running"))
+        self.assertEqual(after_actions, ["diagnose_codex_review"])
+        self.assertTrue(watch.needs_agent_attention(after_actions))
+
+    def test_summary_comment_edit_resets_unwatched_running_timer(self):
+        pr = {
+            "repo": "owner/repo",
+            "number": 42,
+            "head_sha": self.HEAD,
+            "labels": [],
+            "base_branch": "main",
+            "closed": False,
+            "merged": False,
+            "mergeable": "MERGEABLE",
+            "merge_state_status": "CLEAN",
+            "review_decision": "",
+        }
+        t0 = watch.parse_github_time_seconds("2026-11-14T04:00:00Z")
+        clock = [t0]
+        first_comments = [self._state_v1_comment(status="running", created_at="2026-11-14T04:00:00Z")]
+        reedited_comments = [
+            self._state_v1_comment(
+                status="running",
+                created_at="2026-11-14T04:00:00Z",
+                updated_at="2026-11-14T04:11:00Z",
+            )
+        ]
+        args = SimpleNamespace(pr="42", repo=None, state_file=None, max_flaky_retries=3)
+
+        with tempfile.TemporaryDirectory() as tmp, configured():
+            state_path = watch.Path(tmp) / "s.json"
+            with patch.object(watch, "resolve_pr", return_value=pr), \
+                    patch.object(watch, "default_state_file_for", return_value=state_path), \
+                    patch.object(watch, "get_pr_checks", return_value=[_ci_pass()]), \
+                    patch.object(watch, "get_authenticated_login", return_value="octocat"), \
+                    patch.object(watch, "get_pr_issue_reactions", return_value=[]), \
+                    patch.object(watch, "gh_api_list_paginated", side_effect=[
+                        first_comments,
+                        reedited_comments,
+                        reedited_comments,
+                    ]), \
+                    patch.object(watch, "fetch_new_review_items", return_value=([], [])), \
+                    patch.object(watch.time, "time", side_effect=lambda: clock[0]):
+                watch.collect_snapshot(args)
+                clock[0] = t0 + 11 * 60 + 5
+                second, _ = watch.collect_snapshot(args)
+                clock[0] = t0 + 22 * 60
+                third, _ = watch.collect_snapshot(args)
+
+        self.assertEqual(second["actions"], ["wait_codex"])
+        self.assertFalse(second["codex_gate"].get("idle_wait_expired"))
+        self.assertEqual(third["actions"], ["stop_ready_to_merge"])
+        self.assertTrue(third["codex_gate"]["idle_wait_expired"])
+
+
 class CodexCleanReviewCommentTests(unittest.TestCase):
     """Codex's "Didn't find any major issues" comment is a result, not a finding."""
 

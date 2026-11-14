@@ -259,6 +259,7 @@ CHECKS_TERMINAL_GRACE_PERIOD_SECONDS = 60
 # Codex keeps one "Codex Review Summary" status table on the PR and edits it on every review.
 # It never carries a finding, so it must not surface as a review item.
 STATUS_ONLY_BOT_COMMENT_MARKER = "<!-- codex-pull-request-review-summary -->"
+CODEX_REVIEW_STATE_MARKER = "<!-- codex-review-state:v1"
 
 GH_PR_CHECKS_STATE_EXIT_CODES = (0, 1, 8)
 # A hung `gh` call (network trouble, an auth prompt) must not freeze the watcher.
@@ -547,6 +548,9 @@ def reset_seen_tracking_state(state):
     state["pr_af_label_absent_sha"] = None
     state["pr_af_label_rerun_sha"] = None
     state["pr_af_label_rerun_seen_at"] = None
+    state["codex_running_idle_since_at"] = None
+    state["codex_running_idle_sha"] = None
+    state["codex_running_updated_at"] = None
 
 
 def is_state_stale(state, now_seconds=None):
@@ -607,6 +611,9 @@ def load_state(path):
         "pr_af_label_absent_sha": None,
         "pr_af_label_rerun_sha": None,
         "pr_af_label_rerun_seen_at": None,
+        "codex_running_idle_since_at": None,
+        "codex_running_idle_sha": None,
+        "codex_running_updated_at": None,
     }, True
 
 
@@ -1119,12 +1126,57 @@ _CODEX_SUMMARY_ROW = re.compile(
     r"^\|\s*📝\s*\*\*Code Review\*\*\s*\|(?P<status>[^|]*)\|\s*`(?P<sha>[0-9a-f]{7,40})`",
     re.MULTILINE,
 )
+# Machine-readable state comment embedded alongside the summary table, e.g.
+# <!-- codex-review-state:v1 {"code_review":{"commit_sha":"...","status":"running"},...} -->
+_CODEX_REVIEW_STATE_COMMENT = re.compile(
+    r"<!--\s*codex-review-state:v1\s+(?P<payload>\{.*?\})\s*-->",
+    re.DOTALL,
+)
 
 
 # Codex's comment when a review finds nothing, e.g.
 # "Codex Review: Didn't find any major issues. ..." followed by "**Reviewed commit:** `bb9ad50596`".
 _CODEX_CLEAN_REVIEW_PHRASE = re.compile(r"didn[\'\u2019]t find any major issues", re.IGNORECASE)
 _CODEX_REVIEWED_COMMIT = re.compile(r"\*\*Reviewed commit:\*\*\s*`(?P<sha>[0-9a-f]{7,40})`")
+
+
+def is_codex_summary_comment_body(body):
+    text = str(body or "")
+    return STATUS_ONLY_BOT_COMMENT_MARKER in text or CODEX_REVIEW_STATE_MARKER in text
+
+
+def _codex_sha_matches_head(head_sha, candidate_sha):
+    head = str(head_sha or "").strip().lower()
+    candidate = str(candidate_sha or "").strip().lower()
+    return bool(head and candidate) and (head.startswith(candidate) or candidate.startswith(head))
+
+
+def _codex_comment_statuses_for_head(body, head_sha):
+    statuses = set()
+    text = str(body or "")
+    for row in _CODEX_SUMMARY_ROW.finditer(text):
+        if _codex_sha_matches_head(head_sha, row.group("sha")):
+            statuses.add(classify_codex_review_status(row.group("status")))
+    for state_match in _CODEX_REVIEW_STATE_COMMENT.finditer(text):
+        try:
+            payload = json.loads(state_match.group("payload"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        code_review = payload.get("code_review")
+        if not isinstance(code_review, dict):
+            continue
+        commit_sha = code_review.get("commit_sha")
+        status = code_review.get("status")
+        if (
+            isinstance(commit_sha, str)
+            and isinstance(status, str)
+            and status.strip()
+            and _codex_sha_matches_head(head_sha, commit_sha)
+        ):
+            statuses.add(classify_codex_review_status(status))
+    return statuses
 
 
 def is_codex_clean_review_comment(item):
@@ -1161,17 +1213,15 @@ def summarize_codex_head_review(issue_comments, head_sha):
         # A "no major issues" comment for the head proves a completed review of it. One
         # for an older commit proves nothing, and does not make Codex count as active.
         clean_sha = codex_clean_review_commit(comment)
-        if clean_sha and str(head_sha or "").startswith(clean_sha):
+        if clean_sha and _codex_sha_matches_head(head_sha, clean_sha):
             active = True
             head_statuses.add("completed")
             continue
         body = str(comment.get("body") or "")
-        if STATUS_ONLY_BOT_COMMENT_MARKER not in body:
+        if not is_codex_summary_comment_body(body):
             continue
         active = True
-        for row in _CODEX_SUMMARY_ROW.finditer(body):
-            if str(head_sha or "").startswith(row.group("sha")):
-                head_statuses.add(classify_codex_review_status(row.group("status")))
+        head_statuses.update(_codex_comment_statuses_for_head(body, head_sha))
     if "completed" in head_statuses:
         head_status = "completed"
     elif "running" in head_statuses:
@@ -1181,6 +1231,47 @@ def summarize_codex_head_review(issue_comments, head_sha):
     else:
         head_status = "none"
     return {"active": active, "head_reviewed": head_status == "completed", "head_status": head_status}
+
+
+def summarize_codex_running_metadata(reactions, issue_comments, head_sha):
+    """Timestamps for a head whose Codex summary still says Running.
+
+    Codex occasionally removes 👀 and adds 👍 on a clean review without editing its summary
+    comment away from Running. A 👍 reaction proves that only when it was created strictly
+    after the summary comment's latest edit (`updated_at`), so an older 👍 from a prior commit
+    never matches a newly edited Running row.
+    """
+    running_timestamps = []
+    for comment in issue_comments or []:
+        if not isinstance(comment, dict):
+            continue
+        if not is_codex_bot_login(extract_login(comment.get("user"))):
+            continue
+        body = str(comment.get("body") or "")
+        if not is_codex_summary_comment_body(body):
+            continue
+        if "running" not in _codex_comment_statuses_for_head(body, head_sha):
+            continue
+        running_timestamps.append(
+            parse_github_time_seconds(comment.get("updated_at") or comment.get("created_at"))
+        )
+    if not running_timestamps or any(ts is None for ts in running_timestamps):
+        return {}
+    running_updated_at = max(running_timestamps)
+    out = {"running_updated_at": running_updated_at}
+    if isinstance(reactions, list):
+        for reaction in reactions:
+            if not isinstance(reaction, dict):
+                continue
+            if str(reaction.get("content") or "") not in ("+1", "THUMBS_UP"):
+                continue
+            if not is_codex_bot_login(extract_login(reaction.get("user"))):
+                continue
+            reaction_at = parse_github_time_seconds(reaction.get("created_at"))
+            if reaction_at is not None and reaction_at > running_updated_at:
+                out["thumbs_up_after_running"] = True
+                break
+    return out
 
 
 # Words in the status column of Codex's summary table that mean "still working".
@@ -1203,10 +1294,13 @@ def classify_codex_review_status(status_text):
 
 def collect_codex_gate(pr):
     """Codex's review state for the PR: the 👀 reaction plus proof of a review of the head."""
-    codex_gate = summarize_codex_gate(get_pr_issue_reactions(pr["repo"], pr["number"]))
+    reactions = get_pr_issue_reactions(pr["repo"], pr["number"])
+    codex_gate = summarize_codex_gate(reactions)
     try:
         issue_comments = gh_api_list_paginated(comment_endpoints(pr["repo"], pr["number"])["issue_comment"])
         codex_gate.update(summarize_codex_head_review(issue_comments, pr["head_sha"]))
+        if str(codex_gate.get("head_status") or "") == "running":
+            codex_gate.update(summarize_codex_running_metadata(reactions, issue_comments, pr["head_sha"]))
     except GhCommandError:
         # Without the summary comment we cannot prove the head was reviewed: treat as unknown.
         codex_gate.update({"status": "unknown", "active": True, "head_reviewed": False, "head_status": "none"})
@@ -1562,7 +1656,7 @@ def is_pr_af_author(item):
 
 def is_actionable_review_bot_item(item, pr_af_review_ids=None, pr_af_check_present=True):
     author = str(item.get("author") or "")
-    if STATUS_ONLY_BOT_COMMENT_MARKER in str(item.get("body") or ""):
+    if is_codex_summary_comment_body(item.get("body")):
         return False
     if is_codex_clean_review_comment(item):
         return False
@@ -1782,6 +1876,7 @@ def codex_waiting_for_head_review(codex_gate):
     return (
         bool(codex_gate)
         and not bool(codex_gate.get("idle_wait_expired"))
+        and not bool(codex_gate.get("stale_running"))
         and bool(codex_gate.get("active"))
         and not bool(codex_gate.get("head_reviewed"))
         and str(codex_gate.get("head_status") or "") != "failed"
@@ -1789,13 +1884,16 @@ def codex_waiting_for_head_review(codex_gate):
 
 
 def codex_review_failed(codex_gate):
-    """Codex's summary reports a failed or unknown review status for the current head."""
+    """Codex's summary reports a failed, unknown, or stuck-running status for the head."""
     return (
         bool(codex_gate)
         and not bool(codex_gate.get("reviewing"))
         and bool(codex_gate.get("active"))
         and not bool(codex_gate.get("head_reviewed"))
-        and str(codex_gate.get("head_status") or "") == "failed"
+        and (
+            str(codex_gate.get("head_status") or "") == "failed"
+            or bool(codex_gate.get("stale_running"))
+        )
     )
 
 
@@ -1803,40 +1901,118 @@ def codex_required():
     return bool(CONFIG["codex"]["enabled"]) and bool(CONFIG["codex"]["required"])
 
 
-def apply_codex_idle_wait(codex_gate, checks_summary, checks_terminal_elapsed):
-    """Stop waiting for a Codex review of the head that never starts.
+def update_codex_running_idle_elapsed(codex_gate, head_sha, state, now_seconds):
+    """Seconds that Codex's summary has stayed on Running for `head_sha` with no 👀 reaction."""
+    unwatched_running = (
+        bool(codex_gate)
+        and bool(codex_gate.get("active"))
+        and not bool(codex_gate.get("reviewing"))
+        and not bool(codex_gate.get("head_reviewed"))
+        and str(codex_gate.get("head_status") or "") == "running"
+        and str(codex_gate.get("status") or "") != "unknown"
+    )
+    if not unwatched_running:
+        state["codex_running_idle_since_at"] = None
+        state["codex_running_idle_sha"] = None
+        state["codex_running_updated_at"] = None
+        return None
+
+    running_updated_at = codex_gate.get("running_updated_at")
+    head = str(head_sha or "")
+    if (
+        state.get("codex_running_idle_sha") != head
+        or state.get("codex_running_idle_since_at") is None
+        or state.get("codex_running_updated_at") != running_updated_at
+    ):
+        state["codex_running_idle_sha"] = head
+        state["codex_running_idle_since_at"] = int(now_seconds)
+        state["codex_running_updated_at"] = running_updated_at
+    try:
+        first_seen = int(state.get("codex_running_idle_since_at"))
+    except (TypeError, ValueError):
+        first_seen = int(now_seconds)
+        state["codex_running_idle_since_at"] = first_seen
+    return max(0, int(now_seconds) - first_seen)
+
+
+def apply_codex_idle_wait(
+    codex_gate,
+    checks_summary,
+    checks_terminal_elapsed,
+    running_idle_elapsed=None,
+    now_seconds=None,
+):
+    """Stop waiting for a Codex review of the head that never starts or drops its final edit.
 
     Codex can be active on a PR (its summary table exists) and still never review a new
-    head. Without `codex.required`, the watcher waits `codex.idle_wait_minutes` after the
-    checks finish. When Codex has not started by then (no 👀 reaction, no running or
-    completed row for the head), the missing review stops blocking readiness, and the
-    gate says so in `idle_wait_expired` and `note`. A running review still blocks, an
-    unreadable Codex state still waits, and with `codex.required` the watcher asks for a
-    review instead.
+    head, or finish cleanly (removing 👀 and adding 👍) without editing its summary comment
+    away from Running. Without `codex.required`, the watcher waits `codex.idle_wait_minutes`
+    after the checks finish (or the grace period when Codex added 👍 after posting Running),
+    then marks `idle_wait_expired` with a `note`. With `codex.required`, a stuck Running
+    summary without 👀 becomes `stale_running` so `diagnose_codex_review` wakes the agent.
     """
-    if not codex_gate or codex_required():
+    if not codex_gate:
         return codex_gate
     if (
         not codex_gate.get("active")
         or codex_gate.get("reviewing")
         or codex_gate.get("head_reviewed")
-        or str(codex_gate.get("head_status") or "") != "none"
         or str(codex_gate.get("status") or "") == "unknown"
     ):
         return codex_gate
     if not checks_summary.get("all_terminal") or checks_terminal_elapsed is None:
         return codex_gate
+
+    head_status = str(codex_gate.get("head_status") or "")
     minutes = int(CONFIG["codex"]["idle_wait_minutes"])
     limit = max(minutes * 60, CHECKS_TERMINAL_GRACE_PERIOD_SECONDS)
-    if checks_terminal_elapsed < limit:
-        return codex_gate
-    gate = dict(codex_gate)
-    gate["idle_wait_expired"] = True
-    gate["note"] = (
-        f"Codex did not review this head within {minutes} minutes after the checks finished, "
-        "so the missing review no longer blocks readiness."
-    )
-    return gate
+
+    if head_status == "none":
+        if codex_required() or checks_terminal_elapsed < limit:
+            return codex_gate
+        gate = dict(codex_gate)
+        gate["idle_wait_expired"] = True
+        gate["note"] = (
+            f"Codex did not review this head within {minutes} minutes after the checks finished, "
+            "so the missing review no longer blocks readiness."
+        )
+        return gate
+
+    if head_status == "running":
+        if running_idle_elapsed is None:
+            return codex_gate
+        thumbs_up_after_running = bool(codex_gate.get("thumbs_up_after_running"))
+        threshold = CHECKS_TERMINAL_GRACE_PERIOD_SECONDS if (
+            thumbs_up_after_running and not codex_required()
+        ) else limit
+        if checks_terminal_elapsed < threshold or running_idle_elapsed < threshold:
+            return codex_gate
+        running_updated_at = codex_gate.get("running_updated_at")
+        if running_updated_at is not None and now_seconds is not None:
+            if max(0, int(now_seconds) - int(running_updated_at)) < threshold:
+                return codex_gate
+        gate = dict(codex_gate)
+        if codex_required():
+            gate["stale_running"] = True
+            gate["note"] = (
+                f"Codex's summary remained on Running with no 👀 reaction for {minutes} minutes "
+                "after the checks finished, so the review needs attention."
+            )
+            return gate
+        gate["idle_wait_expired"] = True
+        if thumbs_up_after_running:
+            gate["note"] = (
+                "Codex's summary remained on Running, but Codex removed its 👀 reaction and added "
+                "👍 after posting it, so the unedited summary no longer blocks readiness."
+            )
+        else:
+            gate["note"] = (
+                f"Codex's summary remained on Running with no 👀 reaction for {minutes} minutes "
+                "after the checks finished, so the stale review no longer blocks readiness."
+            )
+        return gate
+
+    return codex_gate
 
 
 def codex_review_stale_but_required(codex_gate):
@@ -2089,6 +2265,9 @@ def reset_state_for_new_head_sha(state, head_sha):
         state["pr_af_label_absent_sha"] = None
         state["pr_af_label_rerun_sha"] = None
         state["pr_af_label_rerun_seen_at"] = None
+        state["codex_running_idle_since_at"] = None
+        state["codex_running_idle_sha"] = None
+        state["codex_running_updated_at"] = None
 
 
 def update_pending_checks_first_seen(state, checks, now_seconds):
@@ -2346,7 +2525,14 @@ def collect_snapshot(args):
         checks_terminal_elapsed = None
 
 
-    codex_gate = apply_codex_idle_wait(codex_gate, checks_summary, checks_terminal_elapsed)
+    codex_running_idle_elapsed = update_codex_running_idle_elapsed(codex_gate, head_sha, state, now)
+    codex_gate = apply_codex_idle_wait(
+        codex_gate,
+        checks_summary,
+        checks_terminal_elapsed,
+        running_idle_elapsed=codex_running_idle_elapsed,
+        now_seconds=now,
+    )
     retries_used = current_retry_count(state, pr["head_sha"])
     actions = recommend_actions(
         pr,
