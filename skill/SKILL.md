@@ -1,11 +1,12 @@
 ---
 name: babysit-pr
 description: >
-  Use when asked to watch, monitor, or babysit an open GitHub pull request: poll CI and review gates until ready to
-  merge, fix branch-caused failures, retry flaky runs, triage findings, and stop when a human decision is needed.
+  Use when asked to watch, monitor, or babysit an open GitHub pull request or GitLab merge request (including
+  self-hosted GitLab): poll CI and review gates until ready to merge, fix branch-caused failures, retry flaky runs,
+  triage findings, and stop when a human decision is needed.
 metadata:
   author: "Sebastiano Poggi"
-  version: "2.3.0"
+  version: "2.4.0"
 ---
 
 # PR babysitter
@@ -71,6 +72,19 @@ when the harness reads live streamed stdout. Read `actions` from:
   the owner), `stop_draft_pr` (green draft — ask owner to mark ready), `stop_pr_closed` (merged or closed),
   `stop_session_timeout` (session limit reached; carries last snapshot's `actions`).
 
+## GitLab merge requests
+
+- Use `scripts/glab_mr_watch.py` instead of `gh_pr_watch.py` when the remote host is not `github.com` or the URL
+  contains `/-/merge_requests/`. Same flags, JSON, and actions; `--pr` takes an MR URL, IID, or `auto`. Preflight with
+  `glab auth status --hostname <host>` instead of `gh auth status`.
+- It is the sole authority on readiness there too. Diagnose with `glab mr view`, `glab ci view`, and
+  `glab ci trace <job-id>`, never declare an MR green from them. `pr.detailed_merge_status` holds GitLab's raw verdict.
+- Check names are **job names**. A blocking manual job (`allow_failure: false`) gives `diagnose_skipping_checks`: tell
+  the owner it needs someone to click Run, and never play manual jobs (they often deploy) without the owner's go-ahead.
+- Codex and PR-AF gates are off. Only notes from members with Developer access or higher, review bots, and you count.
+  Unresolved threads block as on GitHub; reply and resolve through the discussions API, and update a `need_rebase`
+  branch by merging the target into it (never GitLab's Rebase button or `/rebase`).
+
 ## Review gates and threads
 
 - **Codex (`codex_gate`):** `chatgpt-codex-connector[bot]` has no CI check; it adds 👀 while reviewing
@@ -131,3 +145,5 @@ when the harness reads live streamed stdout. Read `actions` from:
   [references/heuristics.md](references/heuristics.md)
 - `gh` CLI/REST/GraphQL calls, inline reply + `resolveReviewThread` payloads, and JSON fields read by the watcher ->
   [references/github-api-notes.md](references/github-api-notes.md)
+- `glab` calls, GitLab state mapping, and thread reply/resolve payloads ->
+  [references/gitlab-api-notes.md](references/gitlab-api-notes.md)

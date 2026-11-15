@@ -2456,6 +2456,34 @@ def recommend_actions(
     return unique_actions(actions)
 
 
+def update_checks_terminal_elapsed(state, head_sha, all_terminal, now):
+    """Seconds since the checks of `head_sha` all went terminal, or None while any is pending."""
+    # Track when checks first went all_terminal for the current head SHA.
+    # This timestamp is used to enforce a grace period before emitting
+    # stop_ready_to_merge, preventing a race where the script declares the PR
+    # ready before review bots have finished posting their inline comments.
+    if all_terminal:
+        if state.get("checks_terminal_sha") != head_sha:
+            # First time we see all_terminal for this SHA — record the timestamp.
+            state["checks_terminal_sha"] = head_sha
+            state["checks_went_terminal_at"] = now
+        recorded_at = state.get("checks_went_terminal_at")
+        if recorded_at is None:
+            # SHA matched but timestamp is absent (e.g. manually edited state
+            # file). Initialize to now so the grace period starts from this poll.
+            state["checks_went_terminal_at"] = now
+            checks_terminal_elapsed = 0
+        else:
+            checks_terminal_elapsed = max(0, now - int(recorded_at))
+    else:
+        # Checks are still running — reset so the grace period starts fresh
+        # once they become terminal.
+        state["checks_terminal_sha"] = None
+        state["checks_went_terminal_at"] = None
+        checks_terminal_elapsed = None
+    return checks_terminal_elapsed
+
+
 def collect_snapshot(args):
     pr = resolve_pr(args.pr, repo_override=args.repo)
     state_path = Path(args.state_file) if args.state_file else default_state_file_for(pr)
@@ -2499,31 +2527,10 @@ def collect_snapshot(args):
         pr_af_gate=pr_af_gate,
     )
 
-    # Track when checks first went all_terminal for the current head SHA.
-    # This timestamp is used to enforce a grace period before emitting
-    # stop_ready_to_merge, preventing a race where the script declares the PR
-    # ready before review bots have finished posting their inline comments.
     head_sha = pr["head_sha"]
-    if checks_summary["all_terminal"]:
-        if state.get("checks_terminal_sha") != head_sha:
-            # First time we see all_terminal for this SHA — record the timestamp.
-            state["checks_terminal_sha"] = head_sha
-            state["checks_went_terminal_at"] = now
-        recorded_at = state.get("checks_went_terminal_at")
-        if recorded_at is None:
-            # SHA matched but timestamp is absent (e.g. manually edited state
-            # file). Initialize to now so the grace period starts from this poll.
-            state["checks_went_terminal_at"] = now
-            checks_terminal_elapsed = 0
-        else:
-            checks_terminal_elapsed = max(0, now - int(recorded_at))
-    else:
-        # Checks are still running — reset so the grace period starts fresh
-        # once they become terminal.
-        state["checks_terminal_sha"] = None
-        state["checks_went_terminal_at"] = None
-        checks_terminal_elapsed = None
-
+    checks_terminal_elapsed = update_checks_terminal_elapsed(
+        state, head_sha, checks_summary["all_terminal"], now
+    )
 
     codex_running_idle_elapsed = update_codex_running_idle_elapsed(codex_gate, head_sha, state, now)
     codex_gate = apply_codex_idle_wait(
@@ -2572,6 +2579,11 @@ def collect_snapshot(args):
     return snapshot, state_path
 
 
+def rerun_failed_run(pr, run_id):
+    """Rerun the failed jobs of one workflow run."""
+    gh_text(["run", "rerun", str(run_id), "--failed"], repo=pr["repo"])
+
+
 def retry_failed_now(args):
     snapshot, state_path = collect_snapshot(args)
     pr = snapshot["pr"]
@@ -2618,7 +2630,7 @@ def retry_failed_now(args):
         run_id = run.get("run_id")
         if run_id in (None, ""):
             continue
-        gh_text(["run", "rerun", str(run_id), "--failed"], repo=pr["repo"])
+        rerun_failed_run(pr, run_id)
         result["rerun_run_ids"].append(run_id)
 
     if result["rerun_run_ids"]:

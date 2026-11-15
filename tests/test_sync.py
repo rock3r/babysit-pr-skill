@@ -314,6 +314,8 @@ class RealSkillTests(unittest.TestCase):
         scripts = REPO_ROOT / "skill" / "scripts"
         self.assertTrue((scripts / "gh_pr_watch.py").exists())
         self.assertTrue((scripts / "test_gh_pr_watch.py").exists())
+        self.assertTrue((scripts / "glab_mr_watch.py").exists())
+        self.assertTrue((scripts / "test_glab_mr_watch.py").exists())
 
     def test_skill_references_match_skill_md_links(self):
         import re

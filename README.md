@@ -1,7 +1,8 @@
 # babysit-pr skill
 
-`babysit-pr` is an agent skill that watches a GitHub pull request until it is ready to merge. A Python script polls
-CI, review bots, and review threads, and tells the agent what needs attention. The agent diagnoses failures, fixes
+`babysit-pr` is an agent skill that watches a GitHub pull request or a GitLab merge request (gitlab.com or
+self-hosted) until it is ready to merge. A Python script polls CI, review bots, and review threads, and tells the
+agent what needs attention. The agent diagnoses failures, fixes
 them, triages review findings, and stops when the owner must decide.
 
 This repository holds the one maintained copy of the skill. Other repositories vendor a pinned version of it with
@@ -14,8 +15,9 @@ This repository holds the one maintained copy of the skill. Other repositories v
 | `skill/` | Exactly what `sync.py` copies into a repository. |
 | `skill/SKILL.md` | The instructions for the agent. |
 | `skill/scripts/gh_pr_watch.py` | The watcher. Python 3.9 or newer, standard library only. |
-| `skill/scripts/test_gh_pr_watch.py` | The watcher's tests. They travel with the skill, so repositories can run them in their own CI. |
-| `skill/references/` | Config reference, action playbooks, failure heuristics, and GitHub CLI/API notes. |
+| `skill/scripts/glab_mr_watch.py` | The GitLab watcher. It reuses `gh_pr_watch.py`'s CLI, rules, and output. |
+| `skill/scripts/test_*.py` | The watchers' tests. They travel with the skill, so repositories can run them in their own CI. |
+| `skill/references/` | Config reference, action playbooks, failure heuristics, and GitHub and GitLab CLI/API notes. |
 | `skill/evals/evals.json` | Behavioural evaluation prompts and assertions for the skill instructions. |
 | `skill/config.example.json` | The default config. `sync.py` copies it to `config.json` on the first sync. |
 | `sync.py` | Copies a pinned version of `skill/` into a repository. |
@@ -25,6 +27,8 @@ This repository holds the one maintained copy of the skill. Other repositories v
 
 - Python 3.9 or newer.
 - The GitHub CLI (`gh`), authenticated with access to the repository.
+- For GitLab merge requests: GitLab 15.6 or newer and the GitLab CLI (`glab`), authenticated for the host
+  (`glab auth login --hostname <host>`). The Codex and PR-AF gates are GitHub-only.
 - Git, to run `sync.py`.
 
 ## Add the skill to a repository

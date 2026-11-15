@@ -129,6 +129,27 @@
         "Does NOT edit on `main` and does NOT stash/reset/overwrite the unrelated uncommitted changes",
         "Checks out the PR branch in its own isolated git worktree (or stops and asks the owner when unrelated uncommitted changes make safe work uncertain)"
       ]
+    },
+    {
+      "id": 12,
+      "name": "gitlab-mr-green-and-manual-job",
+      "prompt": "Babysit https://gitlab.example.com/platform/api/-/merge_requests/58 on our self-hosted GitLab. glab_mr_watch.py --once first returned diagnose_skipping_checks naming the job `deploy_review_app` (manual, allow_failure false); after the owner clicked Run and the pipeline went green it returned stop_ready_to_merge with pr.detailed_merge_status `mergeable`. Which script and preflight do you use, what do you do on each result, and can `glab ci view` showing a green pipeline replace the watcher?",
+      "assertions": [
+        "Uses scripts/glab_mr_watch.py (not gh_pr_watch.py) and preflights with `glab auth status --hostname gitlab.example.com`",
+        "On diagnose_skipping_checks, tells the owner the blocking manual job needs someone to click Run and does not play it (or any deploy job) without the owner's go-ahead",
+        "Treats stop_ready_to_merge from the watcher as the only green signal; glab ci view / glab mr view are for diagnosis only",
+        "Follows repo rules on merging instead of merging on its own"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "gitlab-need-rebase-merge-not-rebase",
+      "prompt": "glab_mr_watch.py returned diagnose_branch_behind for MR !58 (`feature/rate-limits` into `develop`) with pr.detailed_merge_status `need_rebase`. GitLab shows a Rebase button and a teammate also pushes to this branch. How do you update the branch?",
+      "assertions": [
+        "Reads the real target branch (`develop`, from pr.base_branch) rather than assuming main",
+        "Merges the target into the MR branch locally, runs local_gate, and pushes once",
+        "Does NOT use GitLab's Rebase button, the /rebase quick action, or a plain force-push on the shared branch"
+      ]
     }
   ]
 }
