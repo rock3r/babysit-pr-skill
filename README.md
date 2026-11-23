@@ -37,7 +37,7 @@ Clone this repository once, then run `sync.py` with the path of the repository t
 
 ```bash
 git clone https://github.com/rock3r/babysit-pr-skill.git
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.3.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.4.0
 ```
 
 `sync.py` does the following:
@@ -57,7 +57,7 @@ edit `config.json` for the repository, and commit the folder.
 
 ```bash
 git -C babysit-pr-skill pull --tags
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.3.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.4.0
 ```
 
 Read [CHANGELOG.md](CHANGELOG.md) for the versions in between. Your `config.json` stays as it is. New config keys
