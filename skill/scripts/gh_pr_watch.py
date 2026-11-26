@@ -256,6 +256,33 @@ GREEN_STATE_MAX_POLL_SECONDS = 60
 # that narrow window, causing the agent to merge before findings are ever seen.
 CHECKS_TERMINAL_GRACE_PERIOD_SECONDS = 60
 
+# After a merge, the base-branch pipeline on the merge commit takes a moment to
+# appear. Without a bounded wait, a repository with no base-branch workflow would
+# block the watch subagent until the session timeout.
+MERGE_PIPELINE_DISCOVERY_GRACE_SECONDS = 5 * 60
+
+# A downstream workflow_run can start just after the push workflows finish.
+# Keep a non-failed terminal result stable for this long before reporting it, so
+# a late workflow never makes the line wrong. GitLab sets this to 0: its pipeline
+# status is already final.
+MERGE_PIPELINE_SETTLE_SECONDS = 60
+
+# GitHub conclusions that make the post-merge pipeline a failure. Cancellation is
+# reported separately, as the issue asks for a distinct `canceled` line.
+MERGE_PIPELINE_FAILED_CONCLUSIONS = {
+    "failure",
+    "timed_out",
+    "startup_failure",
+    "stale",
+}
+# A run that needs a person to approve it is waiting, not failed.
+MERGE_PIPELINE_MANUAL_CONCLUSIONS = {
+    "action_required",
+}
+MERGE_PIPELINE_CANCELED_CONCLUSIONS = {
+    "cancelled",
+}
+
 # Codex keeps one "Codex Review Summary" status table on the PR and edits it on every review.
 # It never carries a finding, so it must not surface as a review item.
 STATUS_ONLY_BOT_COMMENT_MARKER = "<!-- codex-pull-request-review-summary -->"
@@ -315,6 +342,14 @@ def parse_args():
     )
     parser.add_argument("--watch", action="store_true", help="Continuously emit JSONL snapshots")
     parser.add_argument(
+        "--watch-merge-pipeline",
+        action="store_true",
+        help=(
+            "After a merge, wait for the base-branch pipeline on the merge commit "
+            "and print one final line"
+        ),
+    )
+    parser.add_argument(
         "--retry-failed-now",
         action="store_true",
         help="Rerun failed jobs for current failed workflow runs when policy allows",
@@ -354,9 +389,18 @@ def parse_args():
         parser.error("--max-session-minutes must be > 0")
     if args.watch and args.retry_failed_now:
         parser.error("--watch cannot be combined with --retry-failed-now")
-    mode_count = sum([args.once, args.snapshot, args.watch, args.retry_failed_now])
+    mode_count = sum([
+        args.once,
+        args.snapshot,
+        args.watch,
+        args.watch_merge_pipeline,
+        args.retry_failed_now,
+    ])
     if mode_count > 1:
-        parser.error("only one of --once, --snapshot, --watch, --retry-failed-now can be used")
+        parser.error(
+            "only one of --once, --snapshot, --watch, --watch-merge-pipeline, "
+            "--retry-failed-now can be used"
+        )
     if mode_count == 0:
         args.once = True
     return args
@@ -438,7 +482,7 @@ def parse_pr_spec(pr_spec):
 
 def pr_view_fields():
     return (
-        "number,url,state,mergedAt,closedAt,headRefName,headRefOid,"
+        "number,url,state,mergedAt,closedAt,mergeCommit,headRefName,headRefOid,"
         "headRepository,headRepositoryOwner,baseRefName,mergeable,mergeStateStatus,reviewDecision,labels"
     )
 
@@ -469,6 +513,13 @@ def resolve_pr(pr_spec, repo_override=None):
     state = str(data.get("state") or "")
     merged = bool(data.get("mergedAt"))
     closed = bool(data.get("closedAt")) or state.upper() == "CLOSED"
+    merge_commit = data.get("mergeCommit")
+    if isinstance(merge_commit, dict):
+        merge_commit_sha = str(merge_commit.get("oid") or "")
+    elif isinstance(merge_commit, str):
+        merge_commit_sha = merge_commit
+    else:
+        merge_commit_sha = ""
 
     return {
         "number": int(data["number"]),
@@ -480,6 +531,7 @@ def resolve_pr(pr_spec, repo_override=None):
         "state": state,
         "merged": merged,
         "closed": closed,
+        "merge_commit_sha": merge_commit_sha,
         "mergeable": str(data.get("mergeable") or ""),
         "merge_state_status": str(data.get("mergeStateStatus") or ""),
         "review_decision": str(data.get("reviewDecision") or ""),
@@ -736,21 +788,23 @@ def has_green_check_set(checks_summary):
     return not checks_summary.get("required_missing")
 
 
-def get_workflow_runs_for_sha(repo, head_sha):
+def get_workflow_runs_for_sha(repo, head_sha, event="pull_request", branch=None):
+    """All workflow runs for a commit, optionally filtered by event and branch."""
     endpoint = f"repos/{repo}/actions/runs"
     page = 1
     all_runs = []
     while True:
-        data = gh_json(
-            [
-                "api", endpoint, "-X", "GET",
-                "-f", f"head_sha={head_sha}",
-                "-f", "per_page=100",
-                "-f", f"page={page}",
-                "-f", "event=pull_request",
-            ],
-            repo=repo,
-        )
+        args = [
+            "api", endpoint, "-X", "GET",
+            "-f", f"head_sha={head_sha}",
+            "-f", "per_page=100",
+            "-f", f"page={page}",
+        ]
+        if event:
+            args.extend(["-f", f"event={event}"])
+        if branch:
+            args.extend(["-f", f"branch={branch}"])
+        data = gh_json(args, repo=repo)
         if not isinstance(data, dict):
             raise GhCommandError("Unexpected payload from actions runs API")
         runs = data.get("workflow_runs") or []
@@ -777,23 +831,27 @@ def is_retry_eligible_failed_run(run):
     return is_retry_eligible_workflow_name(run.get("workflow_name") or "")
 
 
-def failed_runs_from_workflow_runs(runs, head_sha):
-    # Keep only the latest run per workflow (highest run_id) to ignore
-    # superseded reruns that are no longer the active failure.
+def latest_runs_by_workflow(runs, head_sha=None):
+    """The latest run of each workflow, ignoring superseded reruns."""
     latest_by_workflow = {}
-    for run in runs:
+    for run in runs or []:
         if not isinstance(run, dict):
             continue
-        if str(run.get("head_sha") or "") != head_sha:
+        if head_sha is not None and str(run.get("head_sha") or "") != head_sha:
             continue
         workflow_id = run.get("workflow_id") or run.get("name") or run.get("display_title") or ""
         run_id = run.get("id") or 0
         prev = latest_by_workflow.get(workflow_id)
         if prev is None or run_id > (prev.get("id") or 0):
             latest_by_workflow[workflow_id] = run
+    return list(latest_by_workflow.values())
 
+
+def failed_runs_from_workflow_runs(runs, head_sha):
+    # Keep only the latest run per workflow (highest run_id) to ignore
+    # superseded reruns that are no longer the active failure.
     failed_runs = []
-    for _workflow_id, run in latest_by_workflow.items():
+    for run in latest_runs_by_workflow(runs, head_sha):
         conclusion = str(run.get("conclusion") or "")
         if conclusion not in FAILED_RUN_CONCLUSIONS:
             continue
@@ -814,6 +872,173 @@ def failed_runs_from_workflow_runs(runs, head_sha):
         key=lambda item: (str(item.get("workflow_name") or ""), str(item.get("run_id") or ""))
     )
     return failed_runs
+
+
+def is_base_branch_workflow_run(run, base_branch):
+    """Whether a workflow run belongs to the base branch rather than a PR."""
+    if not isinstance(run, dict):
+        return False
+    if str(run.get("event") or "") in ("pull_request", "pull_request_target"):
+        return False
+    head_branch = str(run.get("head_branch") or "")
+    return not head_branch or head_branch == base_branch
+
+
+def merge_pipeline_target_from_pr(pr, sha_candidates):
+    """Validate a merged PR and build the target for --watch-merge-pipeline."""
+    if not pr.get("merged"):
+        raise ValueError("the pull request is not merged; --watch-merge-pipeline only runs after a merge")
+    repo = str(pr.get("repo") or "")
+    base_branch = str(pr.get("base_branch") or "")
+    if not repo or not base_branch:
+        raise ValueError("unable to determine the repository or base branch for the merged pull request")
+    for candidate in sha_candidates:
+        sha = str(candidate or "").strip()
+        if sha:
+            return {
+                "pr": pr,
+                "repo": repo,
+                "base_branch": base_branch,
+                "merge_sha": sha,
+            }
+    # The merge SHA can still be empty just after a merge; the watch loop re-resolves it.
+    return {"pr": pr, "repo": repo, "base_branch": base_branch, "merge_sha": ""}
+
+
+def collect_merge_pipeline_target(args):
+    """Resolve the PR and the base-branch commit to watch after a merge."""
+    pr = resolve_pr(args.pr, repo_override=args.repo)
+    return merge_pipeline_target_from_pr(pr, [pr.get("merge_commit_sha")])
+
+
+def summarize_merge_pipeline_runs(runs):
+    """Aggregate the workflow runs for a commit into one post-merge pipeline state."""
+    latest = latest_runs_by_workflow(runs)
+    latest.sort(key=lambda run: (str(run.get("name") or ""), str(run.get("id") or "")))
+    if not latest:
+        return {"state": "missing", "runs": []}
+
+    waiting = [
+        run for run in latest
+        if str(run.get("status") or "") == "waiting"
+        or str(run.get("conclusion") or "") in MERGE_PIPELINE_MANUAL_CONCLUSIONS
+    ]
+    pending = [
+        run for run in latest
+        if str(run.get("status") or "") != "completed" and run not in waiting
+    ]
+    if pending:
+        return {"state": "pending", "runs": latest}
+
+    failed = [
+        run for run in latest
+        if str(run.get("conclusion") or "") in MERGE_PIPELINE_FAILED_CONCLUSIONS
+    ]
+    if failed:
+        return {"state": "failed", "runs": failed}
+
+    canceled = [
+        run for run in latest
+        if str(run.get("conclusion") or "") in MERGE_PIPELINE_CANCELED_CONCLUSIONS
+    ]
+    if canceled:
+        return {"state": "canceled", "runs": canceled}
+
+    undecided = [
+        run for run in latest
+        if run not in waiting and not str(run.get("conclusion") or "")
+    ]
+    if undecided:
+        return {"state": "pending", "runs": latest}
+
+    if waiting:
+        run = waiting[0]
+        return {
+            "state": "manual",
+            "runs": waiting,
+            "job": str(run.get("name") or run.get("display_title") or "pipeline"),
+        }
+
+    if all(str(run.get("conclusion") or "") == "skipped" for run in latest):
+        return {"state": "skipped", "runs": latest}
+
+    return {"state": "success", "runs": latest}
+
+
+def get_workflow_run_jobs(repo, run_id):
+    """All jobs of one workflow run, newest attempt only."""
+    page = 1
+    jobs = []
+    while True:
+        data = gh_json(
+            [
+                "api", f"repos/{repo}/actions/runs/{run_id}/jobs", "-X", "GET",
+                "-f", "per_page=100",
+                "-f", f"page={page}",
+                "-f", "filter=latest",
+            ],
+            repo=repo,
+        )
+        if not isinstance(data, dict):
+            raise GhCommandError("Unexpected payload from actions jobs API")
+        batch = data.get("jobs") or []
+        if not isinstance(batch, list):
+            raise GhCommandError("Expected `jobs` to be a list")
+        jobs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return jobs
+
+
+def first_failed_job_name(repo, run):
+    """The first failed job of a failed run, or the workflow name when unavailable."""
+    workflow_name = str(run.get("name") or run.get("display_title") or "pipeline")
+    run_id = run.get("id")
+    if not run_id:
+        return workflow_name
+    try:
+        jobs = get_workflow_run_jobs(repo, run_id)
+    except GhCommandError:
+        return workflow_name
+    failed = [
+        job for job in jobs
+        if isinstance(job, dict)
+        and str(job.get("conclusion") or "") in MERGE_PIPELINE_FAILED_CONCLUSIONS
+    ]
+    if not failed:
+        return workflow_name
+    failed.sort(key=lambda job: (job.get("id") or 0, str(job.get("name") or "")))
+    return str(failed[0].get("name") or "") or workflow_name
+
+
+def get_merge_pipeline_status(target):
+    """One post-merge state for the base-branch runs on the merge commit."""
+    runs = get_workflow_runs_for_sha(
+        target["repo"], target["merge_sha"], event=None, branch=None
+    )
+    runs = [run for run in runs if is_base_branch_workflow_run(run, target["base_branch"])]
+    status = summarize_merge_pipeline_runs(runs)
+    if status["state"] == "failed" and status.get("runs"):
+        status["job"] = first_failed_job_name(target["repo"], status["runs"][0])
+    return status
+
+
+def format_merge_pipeline_result(status):
+    """The single line that --watch-merge-pipeline prints."""
+    state = str(status.get("state") or "")
+    if state == "failed":
+        return f"failed: {status.get('job') or 'pipeline'}"
+    if state == "manual":
+        return f"manual: {status.get('job') or 'pipeline'}"
+    if state in ("success", "canceled", "no_pipeline", "skipped", "timeout"):
+        return state
+    raise ValueError(f"unknown merge pipeline state: {state or 'empty'}")
+
+
+def print_merge_pipeline_result(status):
+    sys.stdout.write(format_merge_pipeline_result(status) + "\n")
+    sys.stdout.flush()
 
 
 def normalize_review_name(name):
@@ -2804,6 +3029,54 @@ def with_session_timeout_action(snapshot):
     return snapshot
 
 
+def run_watch_merge_pipeline(args):
+    """Wait for the base-branch pipeline on the merge commit and print one line."""
+    target = collect_merge_pipeline_target(args)
+    started_at = time.time()
+    no_pipeline_since = None
+    # A non-failed terminal result is held stable before printing, as a late
+    # workflow_run can still start. `held` is (latest status, held since).
+    held = None
+    max_session_seconds = args.max_session_minutes * 60
+    while True:
+        now = time.time()
+        if now - started_at > max_session_seconds:
+            print_merge_pipeline_result(held[0] if held else {"state": "timeout"})
+            return 0
+        try:
+            if not target["merge_sha"]:
+                target = collect_merge_pipeline_target(args)
+            status = get_merge_pipeline_status(target) if target["merge_sha"] else {"state": "missing"}
+        except (GhCommandError, RuntimeError) as err:
+            sys.stderr.write(f"gh_pr_watch.py merge pipeline poll error (retrying): {err}\n")
+            time.sleep(args.poll_seconds)
+            continue
+
+        state = str(status.get("state") or "")
+        if state in ("missing", "pending"):
+            held = None
+            if state == "pending":
+                no_pipeline_since = None
+            elif no_pipeline_since is None:
+                no_pipeline_since = now
+            elif now - no_pipeline_since >= MERGE_PIPELINE_DISCOVERY_GRACE_SECONDS:
+                print_merge_pipeline_result({"state": "no_pipeline"})
+                return 0
+            time.sleep(args.poll_seconds)
+            continue
+
+        no_pipeline_since = None
+        if state != "failed" and MERGE_PIPELINE_SETTLE_SECONDS:
+            since = held[1] if held and held[0].get("state") == state else now
+            held = (status, since)
+            if now - since < MERGE_PIPELINE_SETTLE_SECONDS:
+                time.sleep(args.poll_seconds)
+                continue
+
+        print_merge_pipeline_result(status)
+        return 0
+
+
 def run_watch(args):
     poll_seconds = args.poll_seconds
     last_change_key = None
@@ -2942,6 +3215,8 @@ def main():
         if args.retry_failed_now:
             print_json(retry_failed_now(args))
             return 0
+        if args.watch_merge_pipeline:
+            return run_watch_merge_pipeline(args)
         if args.watch:
             return run_watch(args)
         if args.snapshot:

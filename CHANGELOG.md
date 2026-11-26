@@ -2,6 +2,33 @@
 
 All notable changes to this skill are listed here. Versions follow semantic versioning.
 
+## 2.5.0
+
+This is a minor release: it adds a post-merge pipeline mode and the subagent watch protocol.
+
+### Added
+
+- `--watch-merge-pipeline` on both watchers. After a merged PR/MR, it waits for the base-branch pipeline on the merge
+  commit and prints one bare line: `success`, `failed: <job>`, `canceled`, `manual: <job>`, `skipped`, `no_pipeline`, or
+  `timeout`. GitHub reads `mergeCommit.oid` and ignores `pull_request` runs and runs from other branches. GitLab tries
+  `merge_commit_sha`, then `squash_commit_sha`, then the MR `sha` (fast-forward projects only), re-reads an empty merge
+  SHA, and keeps only pipelines on the target branch. GitHub holds every non-failed result for 60 seconds to catch a late
+  `workflow_run`; an `action_required` run reports `manual`. A
+  failed post-merge pipeline is report-only: the watcher never pushes to the base branch or reruns base-branch jobs.
+- `SKILL.md`: run every blocking wait in a subagent at the lowest model tier and lowest reasoning effort; the subagent
+  returns one action line plus only the identifiers the main agent needs, then the main agent acts and starts a new
+  subagent. Without subagents, run `--once` in the main agent and keep only the action line. A new rule bans hand-written
+  polling loops in the main agent and asks for an uncovered state to be reported as a tooling gap.
+- Three behavioural eval scenarios and a post-merge playbook in `skill/references/actions-and-config.md`.
+
+### Changed
+
+- GitHub snapshots now include `pr.merge_commit_sha`, and GitLab snapshots include `pr.merge_commit_sha` and
+  `pr.squash_commit_sha`. `get_workflow_runs_for_sha()` can look up runs without the `pull_request` event filter for the
+  post-merge mode.
+- `--watch-merge-pipeline` is a separate mode, mutually exclusive with `--once`, `--snapshot`, `--watch`, and
+  `--retry-failed-now`.
+
 ## 2.4.0
 
 ### Added

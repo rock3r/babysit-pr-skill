@@ -5,6 +5,10 @@ self-hosted) until it is ready to merge. A Python script polls CI, review bots, 
 agent what needs attention. The agent diagnoses failures, fixes
 them, triages review findings, and stops when the owner must decide.
 
+Where the harness supports subagents, the blocking wait runs in a cheap subagent that only returns one action line; the
+main agent acts on it and starts the next cycle. After a merge, the same subagent watches the base-branch pipeline on
+the merge commit and reports one line (`success`, `failed: <job>`, `manual: <job>`, and so on).
+
 This repository holds the one maintained copy of the skill. Other repositories vendor a pinned version of it with
 `sync.py`, and keep only their own `config.json` next to it.
 
@@ -37,7 +41,7 @@ Clone this repository once, then run `sync.py` with the path of the repository t
 
 ```bash
 git clone https://github.com/rock3r/babysit-pr-skill.git
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.4.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.5.0
 ```
 
 `sync.py` does the following:
@@ -57,7 +61,7 @@ edit `config.json` for the repository, and commit the folder.
 
 ```bash
 git -C babysit-pr-skill pull --tags
-python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.4.0
+python3 babysit-pr-skill/sync.py ~/src/my-repo --ref v2.5.0
 ```
 
 Read [CHANGELOG.md](CHANGELOG.md) for the versions in between. Your `config.json` stays as it is. New config keys

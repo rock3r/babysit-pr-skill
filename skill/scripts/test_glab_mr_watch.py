@@ -585,6 +585,193 @@ class ReviewItemTests(GlabTestCase):
             self.assertEqual((item["path"], item["line"], item["side"]), ("src/old.py", 12, "old"))
 
 
+class MergePipelineTests(unittest.TestCase):
+    def target(self, **overrides):
+        pr = {"host": HOST, "project_id": 11, "repo": PATH}
+        pr.update(overrides)
+        return {"pr": pr, "repo": PATH, "base_branch": "main", "merge_sha": SHA}
+
+    def test_the_merge_commit_is_the_preferred_sha(self):
+        pr = {
+            "merged": True,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "m" * 40,
+            "squash_commit_sha": "s" * 40,
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})):
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+        self.assertEqual(target["merge_sha"], "m" * 40)
+
+    def test_the_squash_commit_is_the_next_choice(self):
+        pr = {
+            "merged": True,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "s" * 40,
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})):
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+        self.assertEqual(target["merge_sha"], "s" * 40)
+
+    def _head_only_target(self, merge_method):
+        pr = {
+            "merged": True,
+            "host": HOST,
+            "project_id": 11,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "",
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                patch.object(glab, "glab_api", return_value={"merge_method": merge_method}) as api:
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+        api.assert_called_once_with(HOST, "projects/11")
+        return target
+
+    def test_the_head_sha_is_the_last_choice_on_a_fast_forward_project(self):
+        self.assertEqual(self._head_only_target("ff")["merge_sha"], "h" * 40)
+
+    def test_a_merge_commit_project_waits_for_the_merge_sha(self):
+        self.assertEqual(self._head_only_target("merge")["merge_sha"], "")
+
+    def test_an_unmerged_mr_is_rejected(self):
+        pr = {"merged": False, "repo": PATH, "base_branch": "main", "head_sha": SHA}
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})):
+            with self.assertRaisesRegex(ValueError, "not merged"):
+                glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+    def _status(self, pipelines, jobs=None, bridges=None):
+        calls = []
+
+        def fake_list(host, endpoint):
+            calls.append(endpoint)
+            if "/pipelines?" in endpoint:
+                return pipelines
+            if endpoint.endswith("/jobs"):
+                return jobs or []
+            if endpoint.endswith("/bridges"):
+                return bridges or []
+            raise AssertionError(endpoint)
+
+        with patch.object(glab, "glab_api_list", side_effect=fake_list):
+            status = glab.get_merge_pipeline_status(self.target())
+        return status, calls
+
+    def test_a_successful_pipeline_is_success(self):
+        status, calls = self._status([{"id": 5, "status": "success", "ref": "main"}])
+
+        self.assertEqual(status["state"], "success")
+        self.assertIn(f"sha={SHA}", calls[0])
+        self.assertIn("ref=main", calls[0])
+
+    def test_a_running_pipeline_is_pending(self):
+        status, _calls = self._status([{"id": 5, "status": "running", "ref": "main"}])
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_a_failed_pipeline_reports_the_failed_job(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "failed", "ref": "main"}],
+            jobs=[job("build", "failed")],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "build"))
+
+    def test_a_failed_optional_job_is_not_named_as_the_cause(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "failed", "ref": "main"}],
+            jobs=[job("lint", "failed", allow_failure=True, job_id=10), job("deploy", "failed", job_id=12)],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "deploy"))
+
+    def test_a_failed_pipeline_falls_back_to_the_pipeline_name(self):
+        status, _calls = self._status([{"id": 5, "status": "failed", "ref": "main"}])
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "pipeline"))
+
+    def test_a_failed_job_lookup_error_falls_back_to_the_pipeline_name(self):
+        def fake_list(host, endpoint):
+            if "/pipelines?" in endpoint:
+                return [{"id": 5, "status": "failed", "ref": "main"}]
+            raise glab.core.GhCommandError("boom")
+
+        with patch.object(glab, "glab_api_list", side_effect=fake_list):
+            status = glab.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "pipeline"))
+
+    def test_a_canceled_pipeline_is_reported(self):
+        status, _calls = self._status([{"id": 5, "status": "canceled", "ref": "main"}])
+
+        self.assertEqual(status["state"], "canceled")
+
+    def test_a_skipped_pipeline_is_reported(self):
+        status, _calls = self._status([{"id": 5, "status": "skipped", "ref": "main"}])
+
+        self.assertEqual(status["state"], "skipped")
+
+    def test_a_manual_pipeline_reports_the_blocking_job(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "manual", "ref": "main"}],
+            jobs=[job("deploy", "manual", allow_failure=False)],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "deploy"))
+
+    def test_an_optional_manual_job_does_not_name_the_blocker(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "manual", "ref": "main"}],
+            jobs=[job("optional-deploy", "manual", allow_failure=True)],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "pipeline"))
+
+    def test_a_missing_pipeline_falls_back_to_a_sha_only_lookup(self):
+        calls = []
+
+        def fake_list(host, endpoint):
+            calls.append(endpoint)
+            if "ref=main" in endpoint:
+                return []
+            if "/pipelines?" in endpoint:
+                return [{"id": 5, "status": "success", "ref": "main"}]
+            raise AssertionError(endpoint)
+
+        with patch.object(glab, "glab_api_list", side_effect=fake_list):
+            status = glab.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "success")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_sha_only_lookup_ignores_other_refs(self):
+        status, _calls = self._status([{"id": 5, "status": "success", "ref": "feature"}])
+
+        self.assertEqual(status["state"], "missing")
+
+    def test_normalize_mr_carries_the_merge_sha_fields(self):
+        payload = mr_payload(state="merged")
+        payload["merge_commit_sha"] = "m" * 40
+        payload["squash_commit_sha"] = "s" * 40
+
+        pr = glab.normalize_mr(payload, HOST)
+
+        self.assertEqual(pr["merge_commit_sha"], "m" * 40)
+        self.assertEqual(pr["squash_commit_sha"], "s" * 40)
+
+
 class ConfigTests(unittest.TestCase):
     def test_codex_and_pr_af_are_forced_off(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -603,12 +790,18 @@ class ConfigTests(unittest.TestCase):
         with patch.object(core, "collect_snapshot", core.collect_snapshot), \
                 patch.object(core, "rerun_failed_run", core.rerun_failed_run), \
                 patch.object(core, "activate_config", core.activate_config), \
+                patch.object(core, "collect_merge_pipeline_target", None), \
+                patch.object(core, "get_merge_pipeline_status", None), \
+                patch.object(core, "MERGE_PIPELINE_SETTLE_SECONDS", 60), \
                 patch.object(core, "main", return_value=42) as mock_main:
             exit_code = glab.main()
             self.assertEqual(exit_code, 42)
             self.assertIs(core.collect_snapshot, glab.collect_snapshot)
             self.assertIs(core.rerun_failed_run, glab.retry_job)
             self.assertIs(core.activate_config, glab.activate_config)
+            self.assertIs(core.collect_merge_pipeline_target, glab.collect_merge_pipeline_target)
+            self.assertIs(core.get_merge_pipeline_status, glab.get_merge_pipeline_status)
+            self.assertEqual(core.MERGE_PIPELINE_SETTLE_SECONDS, 0)
             mock_main.assert_called_once_with()
 
 

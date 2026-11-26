@@ -8,11 +8,11 @@ timeout, and the watcher decodes all output as UTF-8.
 ### PR metadata
 
 ```bash
-gh pr view --json number,url,state,mergedAt,closedAt,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,mergeable,mergeStateStatus,reviewDecision,labels
+gh pr view --json number,url,state,mergedAt,closedAt,mergeCommit,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,mergeable,mergeStateStatus,reviewDecision,labels
 ```
 
 The watcher uses this to find the PR number, URL, branch, head SHA, labels, and the closed, merged, and mergeable
-state.
+state. `mergeCommit.oid` is the commit the base branch was updated to when the PR merged.
 
 ### PR checks
 
@@ -37,6 +37,21 @@ gh api repos/{owner}/{repo}/actions/runs -X GET -f head_sha=<sha> -f per_page=10
 
 The watcher uses this to find failed workflow runs and the run IDs to rerun. It keeps only the latest run of each
 workflow.
+
+### Post-merge pipeline
+
+```bash
+# All workflow runs for the merge commit (the watcher drops pull_request runs and other branches)
+gh api repos/{owner}/{repo}/actions/runs -X GET -f head_sha=<merge-sha> -f per_page=100 -f page=<p>
+
+# Jobs of a failed run, to name the failed job
+gh api repos/{owner}/{repo}/actions/runs/<run-id>/jobs -X GET -f per_page=100 -f page=<p> -f filter=latest
+```
+
+`--watch-merge-pipeline` waits for these runs and prints one line. A run in `waiting` (deployment approval) or concluded
+`action_required` reports `manual: <workflow>`. A failed run reports its first failed job, or the workflow name when the
+jobs lookup fails. Every result except `failed` is held for 60 seconds to catch a late `workflow_run`; no run within 5
+minutes reports `no_pipeline`. An empty `mergeCommit.oid` is re-read on each poll until it appears.
 
 ### Failed log inspection
 
@@ -143,8 +158,9 @@ gh api graphql -F threadId="<PRRT_...>" -f query='
 | `url` | Finding `owner/repo` |
 | `state` | Detecting closed PRs |
 | `mergedAt` / `closedAt` | Detecting the end state |
+| `mergeCommit.oid` | The base-branch commit to watch after a merge (merge, squash, or rebase) |
 | `headRefName` | Branch name |
-| `baseRefName` | Base branch, for the up-to-date requirement |
+| `baseRefName` | Base branch, for the up-to-date requirement and the post-merge pipeline |
 | `headRefOid` | Head SHA for the workflow run lookup |
 | `mergeable` | Detecting conflicts (`CONFLICTING`) |
 | `mergeStateStatus` | Detecting `BEHIND`, `BLOCKED`, `DIRTY`, `DRAFT`, and `UNKNOWN` |

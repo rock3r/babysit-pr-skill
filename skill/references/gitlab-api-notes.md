@@ -84,6 +84,35 @@ glab api --hostname <host> -X POST projects/<pipeline project id>/jobs/<job id>/
 
 Diagnose a failure with `glab ci view` or `glab ci trace <job id> -R <group>/<project>`.
 
+### Post-merge pipeline
+
+After a merged MR, `--watch-merge-pipeline` resolves the commit that the target branch was updated to, in this order:
+`merge_commit_sha`, `squash_commit_sha`, then the MR `sha`, the last only when the project's `merge_method` is `ff`
+(`GET projects/<id>`). Otherwise it re-reads the MR until a merge SHA appears. It finds the newest pipeline for that commit on the target
+branch:
+
+```bash
+glab api --hostname <host> 'projects/<pipeline project id>/pipelines?sha=<sha>&ref=<target branch>'
+glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/jobs?per_page=100&page=<n>'
+glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/bridges?per_page=100&page=<n>'
+```
+
+If an instance ignores `ref` when `sha` is present, the watcher retries with the SHA only and keeps only pipelines whose
+`ref` equals the target branch. It picks the highest pipeline ID.
+
+| Pipeline status | Printed line | Notes |
+|---|---|---|
+| `success` | `success` | Printed at once; no GitHub-style hold. |
+| `failed` | `failed: <job>` | First failed blocking job or bridge (`allow_failure: false`); the pipeline name when the lookup fails. |
+| `canceled` | `canceled` | |
+| `skipped` | `skipped` | Not a failure. |
+| `manual`, `blocked` | `manual: <job>` | First blocking manual job (`allow_failure: false`); optional manual jobs do not name the blocker. |
+| `created`, `waiting_for_resource`, `preparing`, `pending`, `running`, `scheduled` | none yet | Keep waiting. |
+| no pipeline | `no_pipeline` | After a 5-minute discovery grace. |
+
+If the pipeline is still not terminal at `--max-session-minutes`, it prints `timeout`. The post-merge mode is
+read-only: it never retries a job or pushes to the target branch. A post-merge failure is reported to the owner.
+
 ### Discussions
 
 ```bash

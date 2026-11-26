@@ -6,7 +6,7 @@ description: >
   triage findings, and stop when a human decision is needed.
 metadata:
   author: "Sebastiano Poggi"
-  version: "2.4.0"
+  version: "2.5.0"
 ---
 
 # PR babysitter
@@ -27,6 +27,23 @@ an owner decision.
      another branch, check out the PR branch in an isolated git worktree first; if unrelated uncommitted changes exist,
      stop and ask the owner.
 
+## Watch in a subagent
+
+Run every wait (`--watch`, or one blocking `--once`) in a subagent. Use the lowest model tier the harness offers at
+its lowest reasoning effort: the subagent only runs the watcher and has no judgement to add. Pick from the models this
+harness exposes. Examples: Claude Code `model: "haiku"`, `effort: "low"`; Antigravity, Hydrogen. It must not edit files,
+push, or diagnose. Give it the PR number or URL, not `--pr auto` once the branch may be deleted.
+
+The subagent returns exactly one line: the final action and a one-line summary, with only the identifiers the main
+agent needs. Examples: `stop_ready_to_merge`, `stop_non_retryable_failure: <job>`,
+`process_review_comment: 2 new, 1 blocking (ids 123, 456)`, or `stop_pr_closed: merged; merge_pipeline: success`.
+Never return the full snapshot JSON, comment bodies, or logs. On a merged `stop_pr_closed`, the same subagent runs
+`--watch-merge-pipeline` before returning. The main agent acts on the returned line and starts a new subagent for the
+next cycle.
+
+If the harness has no subagents, run `--once` in the main agent and keep only the action line, not the full JSON.
+Never write your own polling loop in the main agent. If the watcher doesn't cover a state, report it as a tooling gap.
+
 ## Watcher CLI and actions
 
 Run from the repository root (`--pr` accepts `auto`, a PR number, or a PR URL; optional flags: `--repo <owner/repo>`,
@@ -37,12 +54,15 @@ Run from the repository root (`--pr` accepts `auto`, a PR number, or a PR URL; o
 python3 .agents/skills/babysit-pr/scripts/gh_pr_watch.py --pr auto --once             # default: poll every 30s until action needed
 python3 .agents/skills/babysit-pr/scripts/gh_pr_watch.py --pr auto --snapshot         # instant state check, no waiting
 python3 .agents/skills/babysit-pr/scripts/gh_pr_watch.py --pr auto --watch            # stream JSONL events until terminal action
+python3 .agents/skills/babysit-pr/scripts/gh_pr_watch.py --pr <number> --watch-merge-pipeline # after merge: base-branch pipeline, one line
 python3 .agents/skills/babysit-pr/scripts/gh_pr_watch.py --pr auto --retry-failed-now # rerun failed jobs of retry-eligible workflows
 python3 .agents/skills/babysit-pr/scripts/gh_pr_watch.py --print-config               # print effective config JSON
 ```
 
 Use `--once` whenever the harness returns output only on command exit (act, then run `--once` again); use `--watch` only
-when the harness reads live streamed stdout. Read `actions` from:
+when the harness reads live streamed stdout. `--watch-merge-pipeline` is a separate mode, not an action: run it only
+after `stop_pr_closed` reports `pr.merged: true`. It prints one bare line: `success`, `failed: <job>`, `canceled`,
+`manual: <job>`, `skipped`, `no_pipeline`, or `timeout`. Read `actions` from:
 
 - `--once` and `--snapshot`: top-level `actions` (alongside `pr`, `checks`, `failed_runs`, `codex_gate`, `pr_af_gate`,
   `hung_checks`, `new_review_items`, `blocking_review_items`, `retry_state`).
@@ -129,6 +149,10 @@ when the harness reads live streamed stdout. Read `actions` from:
   `gh pr view <n> --json baseRefName` (never assume `main`) -> fetch from the **target** repository's remote (`origin`
   on a fork is the fork, not upstream) -> **merge** the base into the PR branch (rebase with `--force-with-lease` only
   when the owner asked; never plain `--force`), verify earlier fixes remain, run `local_gate`, and push once.
+- **Post-merge pipeline (`stop_pr_closed`):** When `pr.merged` is `true`, the same subagent runs
+  `--watch-merge-pipeline` and appends its one-line result to the action line. On `failed: <job>`, `canceled`,
+  `manual: <job>`, `skipped`, `no_pipeline`, or `timeout`, report the result to the owner; do not push to the base
+  branch or rerun base-branch jobs unless the owner asks. A closed unmerged PR skips this step.
 - **Post-merge cleanup (`stop_pr_closed`):** Clean up **only** when `pr.merged` is `true` (`mergedAt` set); if closed
   unmerged, keep everything and tell the owner. Run from the **main checkout** (never inside the PR worktree; local
   state only — never delete remote branches):

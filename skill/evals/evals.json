@@ -150,6 +150,41 @@
         "Merges the target into the MR branch locally, runs local_gate, and pushes once",
         "Does NOT use GitLab's Rebase button, the /rebase quick action, or a plain force-push on the shared branch"
       ]
+    },
+    {
+      "id": 14,
+      "name": "watch-in-a-cheap-subagent-no-hand-written-polling",
+      "prompt": "You are babysitting PR #930 in a harness that can spawn subagents. Where should the blocking `--once` wait run, what exactly should the subagent return, and what happens between cycles? If the watcher does not cover a state, may the main agent write its own `gh pr checks` polling loop?",
+      "assertions": [
+        "Runs every wait (`--once` or `--watch`) in a subagent at the lowest model tier and lowest reasoning effort, with no file edits, pushes, or diagnosis",
+        "The subagent returns one action line plus only the identifiers the main agent needs, never the full snapshot JSON, comment bodies, or logs",
+        "The main agent acts on that line and starts a new subagent for the next cycle",
+        "Without subagents, runs `--once` in the main agent and keeps only the action line",
+        "Never writes a hand-written polling loop in the main agent; a state the watcher does not cover is reported as a tooling gap"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "post-merge-pipeline-success-and-failure",
+      "prompt": "PR #940 was squash-merged, and `stop_pr_closed` reported `pr.merged: true`. What should the same watch subagent run next, what does a successful result add to the stop line, and what do you do if it prints `failed: build`? Should you push a fix to the base branch or rerun the failed base-branch job?",
+      "assertions": [
+        "Runs `--watch-merge-pipeline` in the same watch subagent after a merged `stop_pr_closed`; a closed unmerged PR skips it",
+        "Uses the base-branch merge commit (GitHub `mergeCommit.oid`), not the PR head SHA, and appends the bare result such as `merge_pipeline: success` to the action line",
+        "On `failed: <job>`, reports the job and pipeline URL to the owner and does not push to the base branch or rerun base-branch jobs unless the owner asks",
+        "Treats `canceled`, `manual: <job>`, `skipped`, `no_pipeline`, and `timeout` as report-only outcomes, not as failures to fix automatically",
+        "May proceed with normal post-merge cleanup after a successful pipeline"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "gitlab-post-merge-squash-sha-and-manual-job",
+      "prompt": "On self-hosted GitLab, MR !72 was squash-merged into `develop`. Which SHA does `glab_mr_watch.py --watch-merge-pipeline` look up, how does it avoid a pipeline from another ref, and what should you do if it prints `no_pipeline` or `manual: deploy_prod`?",
+      "assertions": [
+        "Uses `merge_commit_sha`, then `squash_commit_sha`, then the MR `sha`, and watches the actual target branch (`develop`)",
+        "Looks up the newest pipeline by SHA and target ref; when the instance ignores ref, filters the SHA-only answer by the target branch",
+        "On `no_pipeline` after the 5-minute grace, reports a missing post-merge pipeline as a tooling gap instead of polling by hand",
+        "On `manual: deploy_prod`, tells the owner that a blocking manual job needs someone to click Run and never plays a deploy job without the owner's go-ahead"
+      ]
     }
   ]
 }

@@ -182,6 +182,8 @@ def normalize_mr(mr, host):
         "head_sha": str(mr.get("sha") or ""),
         "head_branch": str(mr.get("source_branch") or ""),
         "base_branch": str(mr.get("target_branch") or ""),
+        "merge_commit_sha": str(mr.get("merge_commit_sha") or ""),
+        "squash_commit_sha": str(mr.get("squash_commit_sha") or ""),
         "state": MR_STATE_MAP.get(raw_state, raw_state.upper()),
         "merged": raw_state == "merged",
         "closed": raw_state not in ("opened", "locked"),
@@ -360,6 +362,127 @@ def get_mr_checks(pr, mr):
 def retry_job(pr, run_id):
     """Replacement for core.rerun_failed_run: retry one failed GitLab job."""
     glab_api(pr["host"], f"projects/{project_ref(pr['pipeline_project_id'])}/jobs/{run_id}/retry", method="POST")
+
+
+# --- Post-merge pipeline ------------------------------------------------------------
+
+
+def collect_merge_pipeline_target(args):
+    """Resolve the MR and the base-branch commit to watch after a merge."""
+    pr, _mr = resolve_mr(args.pr, repo_override=args.repo)
+    candidates = [pr.get("merge_commit_sha"), pr.get("squash_commit_sha")]
+    # Only a fast-forward merge moves the target branch to the MR head itself. With
+    # any other method the merge commit SHA can lag the merge, so wait for it rather
+    # than watch the head.
+    if pr.get("merged") and not any(candidates) and project_merge_method(pr) == "ff":
+        candidates.append(pr.get("head_sha"))
+    return core.merge_pipeline_target_from_pr(pr, candidates)
+
+
+def project_merge_method(pr):
+    project = glab_api(pr["host"], f"projects/{project_ref(pr.get('project_id') or pr['repo'])}")
+    return str(project.get("merge_method") or "") if isinstance(project, dict) else ""
+
+
+def newest_pipeline(pipelines):
+    candidates = [
+        pipeline for pipeline in pipelines or []
+        if isinstance(pipeline, dict) and pipeline.get("id") is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pipeline: pipeline.get("id") or 0)
+
+
+def pipeline_jobs(host, project_id, pipeline_id):
+    """Jobs and bridge jobs of one pipeline, as one list."""
+    base = f"projects/{project_ref(project_id)}/pipelines/{pipeline_id}"
+    jobs = glab_api_list(host, f"{base}/jobs")
+    jobs += glab_api_list(host, f"{base}/bridges")
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def first_pipeline_job_name(jobs, statuses, require_blocking=False):
+    matching = [
+        job for job in jobs
+        if str(job.get("status") or "") in statuses
+        and (not require_blocking or not job.get("allow_failure"))
+    ]
+    if not matching:
+        return "pipeline"
+    matching.sort(key=lambda job: (job.get("id") or 0, str(job.get("name") or "")))
+    return str(matching[0].get("name") or "") or "pipeline"
+
+
+def pipeline_job_name_for(host, project_id, pipeline_id, statuses, require_blocking=False):
+    """A named job when the jobs lookup works, else the generic pipeline name."""
+    try:
+        jobs = pipeline_jobs(host, project_id, pipeline_id)
+    except core.GhCommandError:
+        return "pipeline"
+    return first_pipeline_job_name(jobs, statuses, require_blocking=require_blocking)
+
+
+def find_merge_pipeline(host, project_id, merge_sha, base_branch):
+    """The newest base-branch pipeline for the merge commit, or None."""
+    endpoint = (
+        f"projects/{project_ref(project_id)}/pipelines"
+        f"?sha={quote(merge_sha, safe='')}&ref={quote(base_branch, safe='')}"
+    )
+    matching = [
+        item for item in glab_api_list(host, endpoint)
+        if isinstance(item, dict) and str(item.get("ref") or "") == base_branch
+    ]
+    pipeline = newest_pipeline(matching)
+    if pipeline is not None:
+        return pipeline
+
+    # Some instances ignore `ref` when `sha` is present. Filter the SHA-only
+    # answer ourselves rather than watching a pipeline from another ref.
+    endpoint = f"projects/{project_ref(project_id)}/pipelines?sha={quote(merge_sha, safe='')}"
+    fallback = [
+        item for item in glab_api_list(host, endpoint)
+        if isinstance(item, dict) and str(item.get("ref") or "") == base_branch
+    ]
+    return newest_pipeline(fallback)
+
+
+def get_merge_pipeline_status(target):
+    """One post-merge state for the base-branch pipeline on the merge commit."""
+    pr = target["pr"]
+    host = pr["host"]
+    project_id = pr.get("project_id") or pr.get("pipeline_project_id")
+    if not project_id:
+        raise ValueError("unable to determine the GitLab project for the merged merge request")
+
+    pipeline = find_merge_pipeline(host, project_id, target["merge_sha"], target["base_branch"])
+    if pipeline is None:
+        return {"state": "missing", "runs": []}
+
+    status = str(pipeline.get("status") or "")
+    if status == "success":
+        return {"state": "success", "pipeline": pipeline}
+    if status == "failed":
+        return {
+            "state": "failed",
+            "job": pipeline_job_name_for(
+                host, project_id, pipeline["id"], {"failed"}, require_blocking=True
+            ),
+            "pipeline": pipeline,
+        }
+    if status == "canceled":
+        return {"state": "canceled", "pipeline": pipeline}
+    if status == "skipped":
+        return {"state": "skipped", "pipeline": pipeline}
+    if status in ("manual", "blocked"):
+        return {
+            "state": "manual",
+            "job": pipeline_job_name_for(
+                host, project_id, pipeline["id"], {"manual"}, require_blocking=True
+            ),
+            "pipeline": pipeline,
+        }
+    return {"state": "pending", "pipeline": pipeline}
 
 
 # --- Review items -------------------------------------------------------------------
@@ -605,6 +728,9 @@ def main():
     core.collect_snapshot = collect_snapshot
     core.rerun_failed_run = retry_job
     core.activate_config = activate_config
+    core.collect_merge_pipeline_target = collect_merge_pipeline_target
+    core.get_merge_pipeline_status = get_merge_pipeline_status
+    core.MERGE_PIPELINE_SETTLE_SECONDS = 0
     return core.main()
 
 
