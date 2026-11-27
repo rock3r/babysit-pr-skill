@@ -178,10 +178,11 @@
     {
       "id": 16,
       "name": "gitlab-post-merge-squash-sha-and-manual-job",
-      "prompt": "On self-hosted GitLab, MR !72 was squash-merged into `develop`. Which SHA does `glab_mr_watch.py --watch-merge-pipeline` look up, how does it avoid a pipeline from another ref, and what should you do if it prints `no_pipeline` or `manual: deploy_prod`?",
+      "prompt": "On self-hosted GitLab, MR !72 was squash-merged into `develop`, and the project's `merge_method` is `ff`. Which SHA does `glab_mr_watch.py --watch-merge-pipeline` look up, how does it avoid a pipeline from another ref, and what should you do if it prints `no_pipeline` or `manual: deploy_prod`?",
       "assertions": [
-        "Uses `merge_commit_sha`, then `squash_commit_sha`, then the MR `sha`, and watches the actual target branch (`develop`)",
-        "Looks up the newest pipeline by SHA and target ref; when the instance ignores ref, filters the SHA-only answer by the target branch",
+        "Uses `merge_commit_sha` first; on a fast-forward project falls back to `squash_commit_sha` for a squashed MR (the MR `sha` only when not squashed), and watches the actual target branch (`develop`)",
+        "Does not use `squash_commit_sha` as the target tip on a project whose `merge_method` is `merge` or `rebase_merge`; it waits for `merge_commit_sha` instead",
+        "Tracks every matching pipeline by SHA and target ref for the settle hold while the printed state comes from the newest pipeline; when the instance ignores ref, filters the SHA-only answer by the target branch",
         "On `no_pipeline` after the 5-minute grace, reports a missing post-merge pipeline as a tooling gap instead of polling by hand",
         "On `manual: deploy_prod`, tells the owner that a blocking manual job needs someone to click Run and never plays a deploy job without the owner's go-ahead"
       ]

@@ -43,10 +43,13 @@ that SHA is still empty, waits for the base-branch pipeline on that commit, and 
 | `success` | Every base-branch run/job passed. | Clean up and report. |
 | `failed: <job>` | A run/job failed. | Report the job and the merge commit to the owner. Do not push to the base branch or rerun jobs unless the owner asks. |
 | `canceled` | The pipeline was canceled. | Report to the owner. |
-| `manual: <job>` | A manual job, a deployment approval that requires reviewers, or an `action_required` run blocks the pipeline. A deployment held only by an environment wait timer keeps waiting. | Tell the owner which job needs a person. |
+| `manual: <job>` | A manual job, a deployment approval that requires reviewers, or an `action_required` run blocks the pipeline. A deployment wait with no required reviewers keeps waiting. | Tell the owner which job needs a person. |
 | `skipped` | The pipeline was skipped by its rules. | Report it; it is not a failure. |
 | `no_pipeline` | No base-branch run appeared within 5 minutes. | Report it. Valid for a repo without base-branch pipelines; otherwise check the CI triggers. |
 | `timeout` | The pipeline was still pending at `--max-session-minutes` (a result already in its hold is printed instead). | Report it; do not keep polling by hand. |
+
+Any unfinished run keeps the result pending, so a deployment wait with no required reviewers outranks an earlier
+failed, canceled, or manual run until it finishes.
 
 A closed unmerged PR skips this step. Cleanup can proceed after a merge; a post-merge failure is reported, not fixed
 automatically. Both hosts keep every result except `failed` stable for 60 seconds before printing it, restarting the

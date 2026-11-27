@@ -3309,6 +3309,21 @@ class MergePipelineRunTests(unittest.TestCase):
 
         self.assertEqual(status["state"], "pending")
 
+    def test_a_timer_only_wait_keeps_the_pipeline_pending_over_a_failure(self):
+        # Any unfinished run keeps the pipeline pending, so a timer-only
+        # deployment still wins over an already-failed run.
+        runs = [
+            self.merge_run(1, "Build", "completed", "failure"),
+            self.merge_run(2, "Deploy", "waiting"),
+        ]
+
+        status = watch.summarize_merge_pipeline_runs(
+            runs,
+            waiting_needs_manual=lambda run: False,
+        )
+
+        self.assertEqual(status["state"], "pending")
+
     def test_a_reviewer_gated_wait_needs_a_human(self):
         status = watch.summarize_merge_pipeline_runs(
             [self.merge_run(1, "Deploy", "waiting")],
@@ -3462,6 +3477,18 @@ class MergePipelineStatusTests(unittest.TestCase):
         with patch.object(watch, "gh_json", side_effect=watch.GhCommandError("boom")):
             with self.assertRaises(watch.GhCommandError):
                 watch.waiting_run_needs_manual_approval("owner/repo", run)
+
+    def test_a_malformed_pending_deployment_payload_raises(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=["not-a-deployment"]):
+            with self.assertRaises(watch.GhCommandError):
+                watch.waiting_run_needs_manual_approval("owner/repo", run)
+
+    def test_a_waiting_run_without_an_id_stays_manual(self):
+        self.assertTrue(
+            watch.waiting_run_needs_manual_approval("owner/repo", {"status": "waiting"})
+        )
 
     def test_a_waiting_run_with_only_a_wait_timer_is_not_manual(self):
         run = self.merge_run(1, "Deploy", "waiting")

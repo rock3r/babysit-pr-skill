@@ -49,8 +49,8 @@ gh api repos/{owner}/{repo}/actions/runs/<run-id>/jobs -X GET -f per_page=100 -f
 ```
 
 `--watch-merge-pipeline` waits for these runs and prints one line. A run concluded `action_required`, or a `waiting` run
-whose pending deployment requires reviewers, reports `manual: <workflow>`. A `waiting` run held only by an environment
-wait timer starts on its own and stays pending:
+whose pending deployment has required reviewers, reports `manual: <workflow>`. A `waiting` run whose pending deployments
+have no reviewers (for example, only an environment wait timer) starts on its own and stays pending:
 
 ```bash
 # Pending deployments of a waiting run (reviewers vs. a timer-only wait)

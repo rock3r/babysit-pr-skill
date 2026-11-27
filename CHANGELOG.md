@@ -15,7 +15,7 @@ This is a minor release: it adds a post-merge pipeline mode and the subagent wat
   or the MR `sha` otherwise, re-reads an empty merge SHA, and keeps only pipelines on the target branch. Both hosts hold
   every non-failed result for 60 seconds, restarting the hold whenever an observed run or pipeline appears, retries, or
   changes result, to catch a late `workflow_run`; an `action_required` run or a waiting deployment that requires
-  reviewers reports `manual`, while a deployment held only by a wait timer keeps waiting. Independent invocations of
+  reviewers reports `manual`, while a deployment wait with no required reviewers keeps waiting. Independent invocations of
   one workflow all count, while a rerun replaces its earlier attempt. A job name is flattened to one line before it is
   printed. A failed post-merge pipeline is report-only: the watcher never pushes to the base branch or reruns
   base-branch jobs.

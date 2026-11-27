@@ -969,10 +969,9 @@ def waiting_run_needs_manual_approval(repo, run):
     )
     if not isinstance(pending, list) or not pending:
         return True
-    return any(
-        isinstance(deployment, dict) and bool(deployment.get("reviewers"))
-        for deployment in pending
-    )
+    if not all(isinstance(deployment, dict) for deployment in pending):
+        raise GhCommandError("Unexpected payload from pending deployments API")
+    return any(bool(deployment.get("reviewers")) for deployment in pending)
 
 
 def summarize_merge_pipeline_runs(runs, waiting_needs_manual=None):

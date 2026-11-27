@@ -648,6 +648,25 @@ class MergePipelineTests(unittest.TestCase):
 
             self.assertEqual(target["merge_sha"], "", merge_method)
 
+    def test_an_unreadable_merge_method_waits_for_the_merge_sha(self):
+        pr = {
+            "merged": True,
+            "host": HOST,
+            "project_id": 11,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "s" * 40,
+            "squash": True,
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                patch.object(glab, "glab_api", return_value={}):
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+        self.assertEqual(target["merge_sha"], "")
+
     def _head_only_target(self, merge_method, squash=False):
         pr = {
             "merged": True,
