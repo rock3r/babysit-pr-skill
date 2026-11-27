@@ -61,7 +61,9 @@ A failed run reports its first failed job, or the workflow name when the jobs lo
 is held for 60 seconds to catch a late `workflow_run`, and the hold
 restarts whenever an observed run appears, retries, or changes result; no run within 5 minutes reports `no_pipeline`.
 Independent runs of one workflow all count, so a failed or canceled run is not hidden by a newer successful
-invocation; a rerun replaces its earlier attempt. A `neutral` conclusion is a pass. A poll error clears the hold, and a
+invocation; a rerun replaces its earlier attempt. A `neutral` conclusion is not a pass: it usually means a check has
+something to report (Cursor Bugbot returns it when it has comments), so it prints `failed: <job>`. Any other completed
+conclusion outside `success` and `skipped` is not green either. A poll error clears the hold, and a
 job name is flattened to one line before printing. An empty `mergeCommit.oid` is re-read on each poll until it appears.
 
 ### Failed log inspection

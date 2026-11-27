@@ -804,6 +804,65 @@ class MergePipelineTests(unittest.TestCase):
             core.merge_pipeline_settle_key(after),
         )
 
+    def test_a_newer_success_does_not_hide_an_older_failure(self):
+        # A commit can carry more than one pipeline. Every pipeline counts, so
+        # the worst result is reported instead of the highest pipeline id.
+        status, calls = self._status(
+            [
+                {"id": 5, "status": "failed", "ref": "main"},
+                {"id": 6, "status": "success", "ref": "main"},
+            ],
+            jobs=[job("build", "failed")],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "build"))
+        self.assertTrue(any("/pipelines/5/jobs" in call for call in calls))
+
+    def test_a_newer_success_does_not_hide_an_older_canceled_pipeline(self):
+        status, _calls = self._status([
+            {"id": 5, "status": "canceled", "ref": "main"},
+            {"id": 6, "status": "success", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "canceled")
+
+    def test_a_newer_success_does_not_hide_an_older_manual_pipeline(self):
+        status, _calls = self._status(
+            [
+                {"id": 5, "status": "manual", "ref": "main"},
+                {"id": 6, "status": "success", "ref": "main"},
+            ],
+            jobs=[job("deploy", "manual")],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "deploy"))
+
+    def test_a_running_pipeline_keeps_the_result_pending_even_with_a_failure(self):
+        # Same precedence as GitHub: an unfinished pipeline keeps the result
+        # open, because its result can still change the worst outcome.
+        status, _calls = self._status([
+            {"id": 5, "status": "failed", "ref": "main"},
+            {"id": 6, "status": "running", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_success_and_skipped_pipelines_are_success(self):
+        status, _calls = self._status([
+            {"id": 5, "status": "success", "ref": "main"},
+            {"id": 6, "status": "skipped", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "success")
+
+    def test_all_skipped_pipelines_are_skipped(self):
+        status, _calls = self._status([
+            {"id": 5, "status": "skipped", "ref": "main"},
+            {"id": 6, "status": "skipped", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "skipped")
+
     def test_a_missing_pipeline_falls_back_to_a_sha_only_lookup(self):
         calls = []
 

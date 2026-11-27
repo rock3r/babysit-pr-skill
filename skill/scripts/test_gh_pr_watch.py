@@ -3255,14 +3255,30 @@ class MergePipelineRunTests(unittest.TestCase):
 
         self.assertEqual(status["state"], "pending")
 
-    def test_success_neutral_and_skipped_are_success(self):
+    def test_success_and_skipped_are_success(self):
         runs = [
             self.merge_run(1, "Build", "completed", "success"),
-            self.merge_run(2, "Lint", "completed", "neutral"),
             self.merge_run(3, "Docs", "completed", "skipped"),
         ]
 
         self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
+
+    def test_a_neutral_run_is_not_success(self):
+        # `neutral` usually means a check has something to report, so it must
+        # not turn the post-merge pipeline green.
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "Bugbot", "completed", "neutral")]
+        )
+
+        self.assertEqual(status["state"], "failed")
+
+    def test_a_neutral_run_fails_a_pipeline_with_a_successful_run(self):
+        runs = [
+            self.merge_run(1, "Build", "completed", "success"),
+            self.merge_run(2, "Bugbot", "completed", "neutral"),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "failed")
 
     def test_all_skipped_runs_are_skipped(self):
         status = watch.summarize_merge_pipeline_runs([
@@ -3384,12 +3400,12 @@ class MergePipelineRunTests(unittest.TestCase):
 
         self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "canceled")
 
-    def test_an_unknown_conclusion_waits_instead_of_reporting_success(self):
+    def test_an_unknown_conclusion_is_not_green(self):
         status = watch.summarize_merge_pipeline_runs(
             [self.merge_run(1, "CI", "completed", "mystery")]
         )
 
-        self.assertEqual(status["state"], "pending")
+        self.assertEqual(status["state"], "failed")
 
     def test_a_completed_run_without_a_conclusion_waits(self):
         status = watch.summarize_merge_pipeline_runs([self.merge_run(1, "CI", "completed", "")])
@@ -3540,6 +3556,16 @@ class MergePipelineStatusTests(unittest.TestCase):
         self.assertEqual(status["state"], "failed")
         self.assertEqual(status["job"], "build")
 
+    def test_a_neutral_run_reports_the_non_green_job(self):
+        runs = [self.merge_run(1, "Checks", "completed", "neutral")]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "first_failed_job_name", return_value="bugbot") as job:
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "bugbot"))
+        job.assert_called_once_with("owner/repo", runs[0])
+
     def test_a_failed_job_lookup_falls_back_to_the_workflow_name(self):
         run = self.merge_run(1, "CI", "completed", "failure")
 
@@ -3555,6 +3581,26 @@ class MergePipelineStatusTests(unittest.TestCase):
 
         with patch.object(watch, "get_workflow_run_jobs", return_value=jobs):
             self.assertEqual(watch.first_failed_job_name("owner/repo", run), "lint")
+
+    def test_a_neutral_job_is_named_as_the_non_green_cause(self):
+        run = self.merge_run(1, "Checks", "completed", "neutral")
+        jobs = [
+            {"id": 2, "name": "build", "conclusion": "success"},
+            {"id": 1, "name": "bugbot", "conclusion": "neutral"},
+        ]
+
+        with patch.object(watch, "get_workflow_run_jobs", return_value=jobs):
+            self.assertEqual(watch.first_failed_job_name("owner/repo", run), "bugbot")
+
+    def test_a_neutral_job_does_not_shadow_a_failed_job(self):
+        run = self.merge_run(1, "CI", "completed", "failure")
+        jobs = [
+            {"id": 1, "name": "bugbot", "conclusion": "neutral"},
+            {"id": 2, "name": "build", "conclusion": "failure"},
+        ]
+
+        with patch.object(watch, "get_workflow_run_jobs", return_value=jobs):
+            self.assertEqual(watch.first_failed_job_name("owner/repo", run), "build")
 
 
 class MergePipelineOutputTests(unittest.TestCase):

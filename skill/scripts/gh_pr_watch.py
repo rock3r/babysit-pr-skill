@@ -282,11 +282,17 @@ MERGE_PIPELINE_MANUAL_CONCLUSIONS = {
 MERGE_PIPELINE_CANCELED_CONCLUSIONS = {
     "cancelled",
 }
-# Completed conclusions that count as a pass. `neutral` is GitHub's explicit
-# "finished without a verdict" result; treating it as a pass matches how a check
-# run with a neutral conclusion is displayed as non-failing.
+# Completed conclusions that count as a pass. Only `success` passes: `neutral`
+# usually means a check has something to report (Cursor Bugbot returns it when
+# it has comments), so treating it as green would let the agent merge over a
+# finding. `skipped` is handled separately because an all-skipped pipeline is
+# reported as `skipped`, not `success`.
 MERGE_PIPELINE_SUCCESS_CONCLUSIONS = {
     "success",
+}
+# Conclusions that make a run non-green. `neutral` belongs here for the same
+# reason: a check with something to report is not a pass.
+MERGE_PIPELINE_NOT_GREEN_CONCLUSIONS = MERGE_PIPELINE_FAILED_CONCLUSIONS | {
     "neutral",
 }
 
@@ -1009,7 +1015,7 @@ def summarize_merge_pipeline_runs(runs, waiting_needs_manual=None):
 
     failed = [
         run for run in latest
-        if str(run.get("conclusion") or "") in MERGE_PIPELINE_FAILED_CONCLUSIONS
+        if str(run.get("conclusion") or "") in MERGE_PIPELINE_NOT_GREEN_CONCLUSIONS
     ]
     if failed:
         return {"state": "failed", "runs": failed, "signature": signature}
@@ -1047,9 +1053,14 @@ def summarize_merge_pipeline_runs(runs, waiting_needs_manual=None):
     ):
         return {"state": "success", "runs": latest, "signature": signature}
 
-    # A completed run with a conclusion outside the known sets is not a pass.
-    # Wait for a state this watcher understands rather than report success.
-    return {"state": "pending", "runs": latest, "signature": signature}
+    # A completed run whose conclusion is not success or skipped is not green.
+    # `neutral` is already handled above; this catches any other conclusion so
+    # the watcher never reports success while a check has findings.
+    return {
+        "state": "failed",
+        "runs": [run for run in latest if str(run.get("conclusion") or "") != "skipped"],
+        "signature": signature,
+    }
 
 
 def get_workflow_run_jobs(repo, run_id):
@@ -1093,6 +1104,13 @@ def first_failed_job_name(repo, run):
         if isinstance(job, dict)
         and str(job.get("conclusion") or "") in MERGE_PIPELINE_FAILED_CONCLUSIONS
     ]
+    if not failed:
+        # A run concluded `neutral` has no failed job; name the neutral one so
+        # the line still points at the check with something to report.
+        failed = [
+            job for job in jobs
+            if isinstance(job, dict) and str(job.get("conclusion") or "") == "neutral"
+        ]
     if not failed:
         return workflow_name
     failed.sort(key=lambda job: (job.get("id") or 0, str(job.get("name") or "")))

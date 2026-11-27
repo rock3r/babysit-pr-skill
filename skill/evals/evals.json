@@ -171,6 +171,7 @@
         "Runs `--watch-merge-pipeline` in the same watch subagent after a merged `stop_pr_closed`; a closed unmerged PR skips it",
         "Uses the base-branch merge commit (GitHub `mergeCommit.oid`), not the PR head SHA, and appends the bare result such as `merge_pipeline: success` to the action line",
         "On `failed: <job>`, reports the job and pipeline URL to the owner and does not push to the base branch or rerun base-branch jobs unless the owner asks",
+        "Treats a GitHub `neutral` conclusion as not green (`failed: <job>`, since a check has findings) and never as `success`",
         "Treats `canceled`, `manual: <job>`, `skipped`, `no_pipeline`, and `timeout` as report-only outcomes, not as failures to fix automatically",
         "May proceed with normal post-merge cleanup after a successful pipeline"
       ]
@@ -182,7 +183,7 @@
       "assertions": [
         "Uses `merge_commit_sha` first; on a fast-forward project falls back to `squash_commit_sha` for a squashed MR (the MR `sha` only when not squashed), and watches the actual target branch (`develop`)",
         "Does not use `squash_commit_sha` as the target tip on a project whose `merge_method` is `merge` or `rebase_merge`; it waits for `merge_commit_sha` instead",
-        "Tracks every matching pipeline by SHA and target ref for the settle hold while the printed state comes from the newest pipeline; when the instance ignores ref, filters the SHA-only answer by the target branch",
+        "Tracks every matching pipeline by SHA and target ref for the settle hold, and reports the worst result across them (so an older failure is not hidden by a newer success); when the instance ignores ref, filters the SHA-only answer by the target branch",
         "On `no_pipeline` after the 5-minute grace, reports a missing post-merge pipeline as a tooling gap instead of polling by hand",
         "On `manual: deploy_prod`, tells the owner that a blocking manual job needs someone to click Run and never plays a deploy job without the owner's go-ahead"
       ]

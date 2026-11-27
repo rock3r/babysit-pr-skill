@@ -401,6 +401,28 @@ def newest_pipeline(pipelines):
     return max(candidates, key=lambda pipeline: pipeline.get("id") or 0)
 
 
+# Post-merge pipeline statuses after which a result can be reported. Anything
+# else (created, waiting_for_resource, preparing, pending, running, scheduled)
+# is still on its way.
+MERGE_PIPELINE_TERMINAL_STATUSES = {
+    "success", "failed", "canceled", "skipped", "manual", "blocked",
+}
+MERGE_PIPELINE_FAILED_STATUSES = {"failed"}
+MERGE_PIPELINE_CANCELED_STATUSES = {"canceled"}
+MERGE_PIPELINE_MANUAL_STATUSES = {"manual", "blocked"}
+# Statuses that are green when every pipeline on the commit has one of them.
+MERGE_PIPELINE_GREEN_STATUSES = {"success", "skipped"}
+
+
+def pipelines_with_statuses(pipelines, statuses):
+    return [
+        pipeline for pipeline in pipelines or []
+        if isinstance(pipeline, dict)
+        and pipeline.get("id") is not None
+        and str(pipeline.get("status") or "") in statuses
+    ]
+
+
 def pipeline_jobs(host, project_id, pipeline_id):
     """Jobs and bridge jobs of one pipeline, as one list."""
     base = f"projects/{project_ref(project_id)}/pipelines/{pipeline_id}"
@@ -465,7 +487,12 @@ def merge_pipeline_signature(pipelines):
 
 
 def get_merge_pipeline_status(target):
-    """One post-merge state for the base-branch pipeline on the merge commit."""
+    """One post-merge state for every base-branch pipeline on the merge commit.
+
+    A commit can have several pipelines (for example a push pipeline and a
+    later scheduled one). The worst result wins, mirroring the GitHub
+    aggregation, so an older failure is never hidden by a newer success.
+    """
     pr = target["pr"]
     host = pr["host"]
     project_id = pr.get("project_id") or pr.get("pipeline_project_id")
@@ -474,14 +501,19 @@ def get_merge_pipeline_status(target):
 
     pipelines = find_merge_pipelines(host, project_id, target["merge_sha"], target["base_branch"])
     signature = merge_pipeline_signature(pipelines)
-    pipeline = newest_pipeline(pipelines)
-    if pipeline is None:
+    if not pipelines:
         return {"state": "missing", "runs": [], "signature": signature}
 
-    status = str(pipeline.get("status") or "")
-    if status == "success":
-        return {"state": "success", "pipeline": pipeline, "signature": signature}
-    if status == "failed":
+    pending = [
+        pipeline for pipeline in pipelines
+        if str(pipeline.get("status") or "") not in MERGE_PIPELINE_TERMINAL_STATUSES
+    ]
+    if pending:
+        return {"state": "pending", "pipeline": newest_pipeline(pending), "signature": signature}
+
+    failed = pipelines_with_statuses(pipelines, MERGE_PIPELINE_FAILED_STATUSES)
+    if failed:
+        pipeline = newest_pipeline(failed)
         return {
             "state": "failed",
             "job": pipeline_job_name_for(
@@ -490,11 +522,14 @@ def get_merge_pipeline_status(target):
             "pipeline": pipeline,
             "signature": signature,
         }
-    if status == "canceled":
-        return {"state": "canceled", "pipeline": pipeline, "signature": signature}
-    if status == "skipped":
-        return {"state": "skipped", "pipeline": pipeline, "signature": signature}
-    if status in ("manual", "blocked"):
+
+    canceled = pipelines_with_statuses(pipelines, MERGE_PIPELINE_CANCELED_STATUSES)
+    if canceled:
+        return {"state": "canceled", "pipeline": newest_pipeline(canceled), "signature": signature}
+
+    manual = pipelines_with_statuses(pipelines, MERGE_PIPELINE_MANUAL_STATUSES)
+    if manual:
+        pipeline = newest_pipeline(manual)
         return {
             "state": "manual",
             "job": pipeline_job_name_for(
@@ -503,7 +538,21 @@ def get_merge_pipeline_status(target):
             "pipeline": pipeline,
             "signature": signature,
         }
-    return {"state": "pending", "pipeline": pipeline, "signature": signature}
+
+    if all(
+        str(pipeline.get("status") or "") in MERGE_PIPELINE_GREEN_STATUSES
+        for pipeline in pipelines
+    ):
+        state = (
+            "skipped"
+            if all(str(pipeline.get("status") or "") == "skipped" for pipeline in pipelines)
+            else "success"
+        )
+        return {"state": state, "pipeline": newest_pipeline(pipelines), "signature": signature}
+
+    # A terminal status outside the known sets is not green; keep waiting for a
+    # state this watcher understands rather than reporting success.
+    return {"state": "pending", "pipeline": newest_pipeline(pipelines), "signature": signature}
 
 
 # --- Review items -------------------------------------------------------------------

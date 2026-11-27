@@ -100,17 +100,21 @@ glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/bridge
 ```
 
 If an instance ignores `ref` when `sha` is present, the watcher retries with the SHA only and keeps only pipelines whose
-`ref` equals the target branch. The printed state comes from the highest pipeline ID, while the 60-second hold covers
-every matching pipeline, so a second pipeline that starts later restarts it.
+`ref` equals the target branch. Every matching pipeline counts: the printed state is the worst one, so an older failure
+is never hidden by a newer success. The 60-second hold covers every pipeline, so a second pipeline that starts later
+restarts it.
 
-| Pipeline status | Printed line | Notes |
+The state uses the same precedence as GitHub: any still-running pipeline keeps the result pending, then a failure, a
+cancellation, or a manual block wins over success.
+
+| Aggregate status | Printed line | Notes |
 |---|---|---|
-| `success` | `success` | Held for 60 s like GitHub; a late second pipeline restarts the hold. |
-| `failed` | `failed: <job>` | First failed blocking job or bridge (`allow_failure: false`); the pipeline name when the lookup fails. |
-| `canceled` | `canceled` | |
-| `skipped` | `skipped` | Not a failure. |
-| `manual`, `blocked` | `manual: <job>` | First blocking manual job (`allow_failure: false`); optional manual jobs do not name the blocker. |
-| `created`, `waiting_for_resource`, `preparing`, `pending`, `running`, `scheduled` | none yet | Keep waiting. |
+| every pipeline `success` or `skipped` | `success` | Held for 60 s like GitHub; a late second pipeline restarts the hold. |
+| any pipeline `failed` | `failed: <job>` | Newest failed pipeline's first failed blocking job or bridge (`allow_failure: false`); the pipeline name when the lookup fails. |
+| any pipeline `canceled` | `canceled` | |
+| every pipeline `skipped` | `skipped` | Not a failure. |
+| any pipeline `manual` or `blocked` | `manual: <job>` | Newest such pipeline's first blocking manual job (`allow_failure: false`); optional manual jobs do not name the blocker. |
+| any pipeline `created`, `waiting_for_resource`, `preparing`, `pending`, `running`, `scheduled` | none yet | Keep waiting, even when another pipeline already failed. |
 | no pipeline | `no_pipeline` | After a 5-minute discovery grace. |
 
 If the pipeline is still not terminal at `--max-session-minutes`, it prints `timeout`. The post-merge mode is

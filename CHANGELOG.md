@@ -16,9 +16,10 @@ This is a minor release: it adds a post-merge pipeline mode and the subagent wat
   every non-failed result for 60 seconds, restarting the hold whenever an observed run or pipeline appears, retries, or
   changes result, to catch a late `workflow_run`; an `action_required` run or a waiting deployment that requires
   reviewers reports `manual`, while a deployment wait with no required reviewers keeps waiting. Independent invocations of
-  one workflow all count, while a rerun replaces its earlier attempt. A job name is flattened to one line before it is
-  printed. A failed post-merge pipeline is report-only: the watcher never pushes to the base branch or reruns
-  base-branch jobs.
+  one workflow all count, while a rerun replaces its earlier attempt. A GitHub run concluded `neutral` is not a pass (a
+  check with findings prints `failed: <job>`), and on GitLab every matching pipeline counts, so an older failure is never
+  hidden by a newer success. A job name is flattened to one line before it is printed. A failed post-merge pipeline is
+  report-only: the watcher never pushes to the base branch or reruns base-branch jobs.
 - `SKILL.md`: run every blocking wait in a subagent at the lowest model tier and lowest reasoning effort; the subagent
   returns one action line plus only the identifiers the main agent needs, then the main agent acts and starts a new
   subagent. Without subagents, run `--once` in the main agent and keep only the action line. A new rule bans hand-written
