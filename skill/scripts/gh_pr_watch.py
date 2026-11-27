@@ -1055,12 +1055,14 @@ def summarize_merge_pipeline_runs(runs, waiting_needs_manual=None):
 
     # A completed run whose conclusion is not success or skipped is not green.
     # `neutral` is already handled above; this catches any other conclusion so
-    # the watcher never reports success while a check has findings.
-    return {
-        "state": "failed",
-        "runs": [run for run in latest if str(run.get("conclusion") or "") != "skipped"],
-        "signature": signature,
-    }
+    # the watcher never reports success while a check has findings. Only those
+    # runs are named, so a successful run is not reported as the cause.
+    not_green = [
+        run for run in latest
+        if str(run.get("conclusion") or "") not in MERGE_PIPELINE_SUCCESS_CONCLUSIONS
+        and str(run.get("conclusion") or "") != "skipped"
+    ]
+    return {"state": "failed", "runs": not_green, "signature": signature}
 
 
 def get_workflow_run_jobs(repo, run_id):

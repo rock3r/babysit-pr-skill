@@ -109,12 +109,12 @@ cancellation, or a manual block wins over success.
 
 | Aggregate status | Printed line | Notes |
 |---|---|---|
-| every pipeline `success` or `skipped` | `success` | Held for 60 s like GitHub; a late second pipeline restarts the hold. |
+| any pipeline `created`, `waiting_for_resource`, `preparing`, `pending`, `running`, `scheduled` | none yet | Keep waiting, even when another pipeline already failed. |
 | any pipeline `failed` | `failed: <job>` | Newest failed pipeline's first failed blocking job or bridge (`allow_failure: false`); the pipeline name when the lookup fails. |
 | any pipeline `canceled` | `canceled` | |
-| every pipeline `skipped` | `skipped` | Not a failure. |
 | any pipeline `manual` or `blocked` | `manual: <job>` | Newest such pipeline's first blocking manual job (`allow_failure: false`); optional manual jobs do not name the blocker. |
-| any pipeline `created`, `waiting_for_resource`, `preparing`, `pending`, `running`, `scheduled` | none yet | Keep waiting, even when another pipeline already failed. |
+| every pipeline `skipped` | `skipped` | Not a failure. |
+| every pipeline `success` or `skipped` | `success` | Held for 60 s like GitHub; a late second pipeline restarts the hold. |
 | no pipeline | `no_pipeline` | After a 5-minute discovery grace. |
 
 If the pipeline is still not terminal at `--max-session-minutes`, it prints `timeout`. The post-merge mode is

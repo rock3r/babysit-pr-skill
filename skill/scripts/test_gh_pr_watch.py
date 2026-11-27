@@ -3566,6 +3566,21 @@ class MergePipelineStatusTests(unittest.TestCase):
         self.assertEqual((status["state"], status["job"]), ("failed", "bugbot"))
         job.assert_called_once_with("owner/repo", runs[0])
 
+    def test_an_unknown_conclusion_names_the_non_green_run(self):
+        # A successful run sorted first must not be blamed for another run's
+        # unknown conclusion.
+        runs = [
+            self.merge_run(1, "Alpha", "completed", "success"),
+            self.merge_run(2, "Beta", "completed", "mystery"),
+        ]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "first_failed_job_name", return_value="Beta") as job:
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "Beta"))
+        job.assert_called_once_with("owner/repo", runs[1])
+
     def test_a_failed_job_lookup_falls_back_to_the_workflow_name(self):
         run = self.merge_run(1, "CI", "completed", "failure")
 
