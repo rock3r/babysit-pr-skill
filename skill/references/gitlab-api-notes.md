@@ -95,12 +95,18 @@ tracks every matching pipeline for that commit on the target branch:
 
 ```bash
 glab api --hostname <host> 'projects/<pipeline project id>/pipelines?sha=<sha>&ref=<target branch>'
+glab api --hostname <host> 'projects/<pipeline project id>/pipelines?sha=<sha>&ref=<target branch>&source=parent_pipeline'
+glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/bridges?per_page=100&page=<n>'
 glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/jobs?per_page=100&page=<n>'
 glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/bridges?per_page=100&page=<n>'
 ```
 
 If an instance ignores `ref` when `sha` is present, the watcher retries with the SHA only and keeps only pipelines whose
-`ref` equals the target branch. Every matching pipeline counts: the printed state is the worst one, so an older failure
+`ref` equals the target branch. The list leaves child pipelines out unless `source=parent_pipeline` asks for them, so
+the watcher makes that second query too, in the same form (with or without `ref`) that found the parents, and only when
+a parent exists: a child triggered without `strategy: depend` can still run or fail after its parent succeeds. When
+children exist, it reads each pipeline's bridges and drops a child whose trigger job, or an ancestor's, has
+`allow_failure: true`, as GitLab keeps the parent green for it. Multi-project downstream pipelines are not followed. Every matching pipeline counts: the printed state is the worst one, so an older failure
 is never hidden by a newer success. The 60-second hold covers every pipeline, so a second pipeline that starts later
 restarts it.
 

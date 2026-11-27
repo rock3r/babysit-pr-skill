@@ -453,25 +453,79 @@ def pipeline_job_name_for(host, project_id, pipeline_id, statuses, require_block
 
 
 def find_merge_pipelines(host, project_id, merge_sha, base_branch):
-    """Every base-branch pipeline for the merge commit, or an empty list."""
-    endpoint = (
-        f"projects/{project_ref(project_id)}/pipelines"
-        f"?sha={quote(merge_sha, safe='')}&ref={quote(base_branch, safe='')}"
-    )
-    matching = [
-        item for item in glab_api_list(host, endpoint)
-        if isinstance(item, dict) and str(item.get("ref") or "") == base_branch
-    ]
-    if matching:
-        return matching
+    """Every base-branch pipeline for the merge commit, child pipelines included.
 
-    # Some instances ignore `ref` when `sha` is present. Filter the SHA-only
-    # answer ourselves rather than watching a pipeline from another ref.
-    endpoint = f"projects/{project_ref(project_id)}/pipelines?sha={quote(merge_sha, safe='')}"
+    The list endpoint leaves child pipelines out unless `source=parent_pipeline`
+    asks for them. A child triggered without `strategy: depend` can still run or
+    fail after its parent succeeds, so it counts like any other pipeline, unless
+    its trigger job allows it to fail.
+    """
+    # ponytail: multi-project downstream pipelines live in other projects and are not followed.
+    use_ref = True
+    parents = _list_base_branch_pipelines(host, project_id, merge_sha, base_branch, use_ref)
+    if not parents:
+        # Some instances ignore `ref` when `sha` is present. Filter the SHA-only
+        # answer ourselves rather than watching a pipeline from another ref.
+        use_ref = False
+        parents = _list_base_branch_pipelines(host, project_id, merge_sha, base_branch, use_ref)
+    if not parents:
+        # A child pipeline needs a parent, so there is nothing more to find.
+        return []
+
+    # Ask for children the way the parent query worked, so each poll adds one call.
+    children = _list_base_branch_pipelines(
+        host, project_id, merge_sha, base_branch, use_ref, source="parent_pipeline"
+    )
+    pipelines = {}
+    for pipeline in parents + children:
+        pipelines.setdefault(pipeline.get("id"), pipeline)
+    # An instance that ignores `source` returns the parents again: no children then.
+    if len(pipelines) > len({pipeline.get("id") for pipeline in parents}):
+        optional = optional_child_pipeline_ids(host, project_id, list(pipelines.values()))
+        pipelines = {pid: pipeline for pid, pipeline in pipelines.items() if pid not in optional}
+    return list(pipelines.values())
+
+
+def _list_base_branch_pipelines(host, project_id, merge_sha, base_branch, use_ref, source=None):
+    params = f"sha={quote(merge_sha, safe='')}"
+    if use_ref:
+        params += f"&ref={quote(base_branch, safe='')}"
+    if source:
+        params += f"&source={quote(source, safe='')}"
     return [
-        item for item in glab_api_list(host, endpoint)
-        if isinstance(item, dict) and str(item.get("ref") or "") == base_branch
+        item for item in glab_api_list(host, f"projects/{project_ref(project_id)}/pipelines?{params}")
+        if isinstance(item, dict)
+        and item.get("id") is not None
+        and str(item.get("ref") or "") == base_branch
     ]
+
+
+def optional_child_pipeline_ids(host, project_id, pipelines):
+    """Child pipelines GitLab lets fail: their trigger job, or an ancestor's, has `allow_failure`.
+
+    A lookup error raises, so the watch loop retries instead of guessing.
+    """
+    parent_of = {}
+    for pipeline in pipelines:
+        bridges = glab_api_list(
+            host, f"projects/{project_ref(project_id)}/pipelines/{pipeline['id']}/bridges"
+        )
+        for bridge in bridges:
+            downstream = bridge.get("downstream_pipeline") if isinstance(bridge, dict) else None
+            if isinstance(downstream, dict) and downstream.get("id") is not None:
+                parent_of[downstream["id"]] = (pipeline["id"], bool(bridge.get("allow_failure")))
+
+    optional = set()
+    for child_id in parent_of:
+        current, seen = child_id, set()
+        while current in parent_of and current not in seen:
+            seen.add(current)
+            parent_id, allowed = parent_of[current]
+            if allowed:
+                optional.add(child_id)
+                break
+            current = parent_id
+    return optional
 
 
 def merge_pipeline_signature(pipelines):

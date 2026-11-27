@@ -887,11 +887,19 @@ def failed_runs_from_workflow_runs(runs, head_sha):
     return failed_runs
 
 
+# Events whose runs come from the merge itself. Others such as `issue_comment`,
+# `issues`, `schedule` or `repository_dispatch` also run on the base-branch HEAD,
+# which is the merge commit right after a merge, but say nothing about it.
+MERGE_PIPELINE_EVENTS = {
+    "push", "workflow_run", "workflow_dispatch", "dynamic", "check_suite", "deployment", "deployment_status",
+}
+
+
 def is_base_branch_workflow_run(run, base_branch):
-    """Whether a workflow run belongs to the base branch rather than a PR."""
+    """Whether a workflow run belongs to the merge on the base branch."""
     if not isinstance(run, dict):
         return False
-    if str(run.get("event") or "") in ("pull_request", "pull_request_target"):
+    if str(run.get("event") or "") not in MERGE_PIPELINE_EVENTS:
         return False
     head_branch = str(run.get("head_branch") or "")
     # A run with no branch is not provably on the base branch. Watching it could
@@ -961,9 +969,11 @@ def waiting_run_needs_manual_approval(repo, run):
     """Whether a `waiting` run is blocked on a person rather than a wait timer.
 
     GitHub reports a run held by an environment protection rule as `waiting`.
-    With required reviewers it needs a person, but a deployment with only a wait
-    timer starts on its own, so it must keep the watcher polling instead of
-    reporting `manual` and exiting before the deployment runs. A failed lookup
+    Only a deployment held by a wait timer that is still running starts on its
+    own, so it keeps the watcher polling instead of reporting `manual` and exiting
+    before the deployment runs. Required reviewers, a custom protection rule (no
+    reviewers and no timer), or a timer that has already elapsed need someone, so
+    they are manual. A failed lookup
     raises so the watch loop retries; an empty pending list is not a deployment
     approval, so it stays manual and preserves the previous behavior.
     """
@@ -977,7 +987,22 @@ def waiting_run_needs_manual_approval(repo, run):
         return True
     if not all(isinstance(deployment, dict) for deployment in pending):
         raise GhCommandError("Unexpected payload from pending deployments API")
-    return any(bool(deployment.get("reviewers")) for deployment in pending)
+    now = time.time()
+    return not all(deployment_waits_on_timer_only(deployment, now) for deployment in pending)
+
+
+def deployment_waits_on_timer_only(deployment, now):
+    """A pending deployment with no reviewers whose wait timer is still running."""
+    if deployment.get("reviewers"):
+        return False
+    try:
+        minutes = int(deployment.get("wait_timer") or 0)
+    except (TypeError, ValueError):
+        return False
+    if minutes <= 0:
+        return False
+    started = parse_github_time_seconds(deployment.get("wait_timer_started_at"))
+    return started is None or now < started + minutes * 60
 
 
 def summarize_merge_pipeline_runs(runs, waiting_needs_manual=None):
@@ -3178,9 +3203,21 @@ def with_session_timeout_action(snapshot):
     return snapshot
 
 
+# Errors worth retrying on the first PR/MR lookup: a server, network, or rate-limit
+# hiccup. Anything else there (a missing PR, a mistyped repo, bad auth, no CLI)
+# cannot fix itself, so it fails at once instead of waiting out the session.
+TRANSIENT_ERROR_PATTERN = re.compile(
+    r"HTTP 5\d\d|HTTP 429|rate limit|timed out|timeout|connection (reset|refused)|unexpected EOF"
+    r"|no such host|temporary failure|network is unreachable",
+    re.IGNORECASE,
+)
+
+
 def run_watch_merge_pipeline(args):
     """Wait for the base-branch pipeline on the merge commit and print one line."""
-    target = collect_merge_pipeline_target(args)
+    # Resolved inside the loop, so a transient error on the first lookup is retried
+    # like any later poll. An unmerged PR (ValueError) still fails at once.
+    target = None
     started_at = time.time()
     no_pipeline_since = None
     # A non-failed terminal result is held stable before printing, as a late
@@ -3195,10 +3232,12 @@ def run_watch_merge_pipeline(args):
             print_merge_pipeline_result(held[1] if held else {"state": "timeout"})
             return 0
         try:
-            if not target["merge_sha"]:
+            if target is None or not target["merge_sha"]:
                 target = collect_merge_pipeline_target(args)
             status = get_merge_pipeline_status(target) if target["merge_sha"] else {"state": "missing"}
         except (GhCommandError, RuntimeError) as err:
+            if target is None and not TRANSIENT_ERROR_PATTERN.search(str(err)):
+                raise
             sys.stderr.write(f"gh_pr_watch.py merge pipeline poll error (retrying): {err}\n")
             # The last good poll is no longer a settled observation: an outage can
             # hide a late failing run or consume the discovery window, so both

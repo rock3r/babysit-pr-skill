@@ -702,16 +702,20 @@ class MergePipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not merged"):
                 glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
 
-    def _status(self, pipelines, jobs=None, bridges=None):
+    def _status(self, pipelines, jobs=None, bridges=None, children=None, pipeline_bridges=None):
         calls = []
 
         def fake_list(host, endpoint):
             calls.append(endpoint)
+            if "/pipelines?" in endpoint and "source=parent_pipeline" in endpoint:
+                return children or []
             if "/pipelines?" in endpoint:
                 return pipelines
             if endpoint.endswith("/jobs"):
                 return jobs or []
             if endpoint.endswith("/bridges"):
+                if pipeline_bridges is not None:
+                    return pipeline_bridges.get(int(endpoint.split("/")[-2]), [])
                 return bridges or []
             raise AssertionError(endpoint)
 
@@ -725,6 +729,70 @@ class MergePipelineTests(unittest.TestCase):
         self.assertEqual(status["state"], "success")
         self.assertIn(f"sha={SHA}", calls[0])
         self.assertIn("ref=main", calls[0])
+
+    def test_a_failed_child_pipeline_is_not_hidden_by_a_successful_parent(self):
+        # A child triggered without `strategy: depend` leaves its parent green.
+        status, calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            jobs=[job("deploy", "failed")],
+            children=[{"id": 6, "status": "failed", "ref": "main"}],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "deploy"))
+        self.assertTrue(any("source=parent_pipeline" in call and f"sha={SHA}" in call for call in calls))
+        self.assertIn("projects/11/pipelines/6/jobs", " ".join(calls))
+
+    def test_a_child_whose_trigger_allows_failure_does_not_count(self):
+        # GitLab keeps the parent green on purpose, and so must the watcher,
+        # for the child and for anything that child triggers in turn.
+        def bridge(downstream_id, allow_failure):
+            return {"name": "trigger", "status": "success", "allow_failure": allow_failure,
+                    "downstream_pipeline": {"id": downstream_id}}
+
+        status, _calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            children=[
+                {"id": 6, "status": "failed", "ref": "main"},
+                {"id": 7, "status": "running", "ref": "main"},
+                {"id": 8, "status": "success", "ref": "main"},
+            ],
+            pipeline_bridges={5: [bridge(6, True), bridge(8, False)], 6: [bridge(7, False)]},
+        )
+
+        self.assertEqual(status["state"], "success")
+
+    def test_a_required_grandchild_failure_counts(self):
+        def bridge(downstream_id):
+            return {"name": "trigger", "allow_failure": False, "downstream_pipeline": {"id": downstream_id}}
+
+        status, _calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            children=[{"id": 6, "status": "success", "ref": "main"}, {"id": 7, "status": "failed", "ref": "main"}],
+            pipeline_bridges={5: [bridge(6)], 6: [bridge(7)]},
+        )
+
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["pipeline"]["id"], 7)
+
+    def test_without_children_no_bridge_lookup_is_made(self):
+        _status, calls = self._status([{"id": 5, "status": "success", "ref": "main"}])
+
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(any(call.endswith("/bridges") for call in calls))
+
+    def test_no_child_query_without_a_parent(self):
+        _status, calls = self._status([])
+
+        self.assertFalse(any("source=parent_pipeline" in call for call in calls))
+
+    def test_a_running_child_pipeline_keeps_the_result_pending(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            children=[{"id": 6, "status": "running", "ref": "main"}],
+        )
+
+        self.assertEqual(status["state"], "pending")
+        self.assertEqual(status["pipeline"]["id"], 6)
 
     def test_a_running_pipeline_is_pending(self):
         status, _calls = self._status([{"id": 5, "status": "running", "ref": "main"}])
@@ -870,6 +938,8 @@ class MergePipelineTests(unittest.TestCase):
             calls.append(endpoint)
             if "ref=main" in endpoint:
                 return []
+            if "source=parent_pipeline" in endpoint:
+                return []
             if "/pipelines?" in endpoint:
                 return [{"id": 5, "status": "success", "ref": "main"}]
             raise AssertionError(endpoint)
@@ -878,7 +948,10 @@ class MergePipelineTests(unittest.TestCase):
             status = glab.get_merge_pipeline_status(self.target())
 
         self.assertEqual(status["state"], "success")
-        self.assertEqual(len(calls), 2)
+        # Ref-filtered then SHA-only for parents; children reuse the form that worked.
+        self.assertEqual(len(calls), 3)
+        self.assertIn("source=parent_pipeline", calls[2])
+        self.assertNotIn("ref=", calls[2])
 
     def test_a_sha_only_lookup_ignores_other_refs(self):
         status, _calls = self._status([{"id": 5, "status": "success", "ref": "feature"}])

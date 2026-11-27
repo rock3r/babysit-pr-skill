@@ -3443,6 +3443,35 @@ class MergePipelineStatusTests(unittest.TestCase):
 
         self.assertEqual(status["state"], "success")
 
+    def test_runs_from_events_unrelated_to_the_merge_are_ignored(self):
+        # An issue comment or a schedule runs on the base-branch HEAD, which is
+        # the merge commit right after a merge, but says nothing about the merge.
+        runs = [
+            self.merge_run(1, "Triage", "completed", "failure", event="issue_comment"),
+            self.merge_run(2, "Nightly", "completed", "neutral", event="schedule"),
+            self.merge_run(3, "Labels", "in_progress", event="issues"),
+            self.merge_run(4, "Unknown", "completed", "failure", event=""),
+            self.merge_run(5, "CI", "completed", "success"),
+        ]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "success")
+
+    def test_runs_started_by_the_merge_all_count(self):
+        for event in ("push", "workflow_run", "workflow_dispatch", "dynamic", "deployment"):
+            runs = [
+                self.merge_run(1, "CI", "completed", "success"),
+                self.merge_run(2, "Deploy", "completed", "failure", event=event),
+            ]
+
+            with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                    patch.object(watch, "first_failed_job_name", return_value="deploy"):
+                status = watch.get_merge_pipeline_status(self.target())
+
+            self.assertEqual(status["state"], "failed", event)
+
     def test_runs_without_a_branch_are_ignored(self):
         # An empty head_branch cannot be proven to be the base branch. A failed
         # run from an unknown ref must not turn the post-merge result red.
@@ -3505,6 +3534,32 @@ class MergePipelineStatusTests(unittest.TestCase):
         self.assertTrue(
             watch.waiting_run_needs_manual_approval("owner/repo", {"status": "waiting"})
         )
+
+    def test_a_custom_protection_rule_wait_is_manual(self):
+        # A GitHub App gate lists neither reviewers nor a timer, and never clears by itself.
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "prod"}, "wait_timer": 0, "reviewers": []}]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_a_wait_timer_that_has_elapsed_is_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+        deployment = {"wait_timer": 5, "wait_timer_started_at": "2026-01-01T00:00:00Z", "reviewers": []}
+        started = watch.parse_github_time_seconds(deployment["wait_timer_started_at"])
+
+        for now, manual in ((started + 4 * 60, False), (started + 6 * 60, True)):
+            with patch.object(watch, "gh_json", return_value=[deployment]), \
+                    patch.object(watch.time, "time", return_value=now):
+                self.assertEqual(watch.waiting_run_needs_manual_approval("owner/repo", run), manual)
+
+    def test_a_timer_and_a_custom_gate_together_are_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "staging"}, "wait_timer": 30, "reviewers": []},
+                {"environment": {"name": "prod"}, "wait_timer": 0, "reviewers": []}]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
 
     def test_a_waiting_run_with_only_a_wait_timer_is_not_manual(self):
         run = self.merge_run(1, "Deploy", "waiting")
@@ -3786,6 +3841,39 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         self.assertEqual(out, "failed: build\n")
         self.assertEqual(collector.call_count, 3)
         getter.assert_called_once_with(self.target())
+
+    def test_a_transient_error_on_the_first_lookup_is_retried(self):
+        for message in (
+            "HTTP 503: Service Unavailable",
+            "GitHub CLI command timed out: gh pr view 7",
+            "read tcp: connection reset by peer",
+            "API rate limit exceeded",
+        ):
+            targets = [watch.GhCommandError(message), self.target()]
+
+            out, collector, _getter = self.run_clocked([{"state": "failed", "job": "build"}], targets=targets)
+
+            self.assertEqual(out, "failed: build\n", message)
+            self.assertEqual(collector.call_count, 2, message)
+
+    def test_a_permanent_error_on_the_first_lookup_fails_at_once(self):
+        errors = [
+            watch.GhCommandError("GraphQL: Could not resolve to a PullRequest with the number of 999."),
+            watch.GhCommandError("glab: 404 Not Found (HTTP 404)"),
+            watch.GhCommandError("GraphQL: Could not resolve to a Repository with the name 'owner/typo'."),
+            watch.GhCommandError("HTTP 401: Bad credentials"),
+            watch.GhCommandError("`gh` command not found"),
+            ValueError("the pull request is not merged"),
+        ]
+        for error in errors:
+            with patch.object(watch, "collect_merge_pipeline_target", side_effect=[error]) as collector, \
+                    patch.object(watch, "get_merge_pipeline_status") as getter, \
+                    patch.object(watch.time, "sleep") as sleep:
+                with self.assertRaises(type(error)):
+                    watch.run_watch_merge_pipeline(self.args())
+            self.assertEqual(collector.call_count, 1, error)
+            getter.assert_not_called()
+            sleep.assert_not_called()
 
     def test_a_canceled_pipeline_is_held_and_a_late_run_resets_it(self):
         statuses = [{"state": "canceled"}, {"state": "pending"}, {"state": "canceled"}] + [{"state": "canceled"}] * 2

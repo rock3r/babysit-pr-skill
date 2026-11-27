@@ -15,11 +15,17 @@ This is a minor release: it adds a post-merge pipeline mode and the subagent wat
   or the MR `sha` otherwise, re-reads an empty merge SHA, and keeps only pipelines on the target branch. Both hosts hold
   every non-failed result for 60 seconds, restarting the hold whenever an observed run or pipeline appears, retries, or
   changes result, to catch a late `workflow_run`; an `action_required` run or a waiting deployment that requires
-  reviewers reports `manual`, while a deployment wait with no required reviewers keeps waiting. Independent invocations of
+  reviewers reports `manual`, while a deployment held only by a running wait timer keeps waiting. Independent invocations of
   one workflow all count, while a rerun replaces its earlier attempt. A GitHub run concluded `neutral` is not a pass (a
-  check with findings prints `failed: <job>`), and on GitLab every matching pipeline counts, so an older failure is never
-  hidden by a newer success. A job name is flattened to one line before it is printed. A failed post-merge pipeline is
-  report-only: the watcher never pushes to the base branch or reruns base-branch jobs.
+  check with findings prints `failed: <job>`), and on GitLab every matching pipeline counts, child pipelines included (except one whose trigger job
+  allows failure), so an older failure is never hidden by a newer success. On GitHub only runs from events the merge
+  starts count (`push`, `workflow_run`, `workflow_dispatch`, `dynamic`, `check_suite`, `deployment`,
+  `deployment_status`), so an `issue_comment` or `schedule` run on the merge commit cannot decide the result. A waiting
+  deployment is pending only while every gate is a wait timer that has not elapsed; a custom protection rule reports
+  `manual`. A job name is flattened to one line before it is printed. A failed post-merge pipeline is
+  report-only: the watcher never pushes to the base branch or reruns base-branch jobs. A transient error (HTTP 5xx or
+  429, a timeout, a dropped connection) on the first PR/MR lookup is retried like a later poll; any other error there,
+  such as a missing PR/MR, a mistyped repo, or bad auth, fails at once, as does an unmerged PR/MR.
 - `SKILL.md`: run every blocking wait in a subagent at the lowest model tier and lowest reasoning effort; the subagent
   returns one action line plus only the identifiers the main agent needs, then the main agent acts and starts a new
   subagent. Without subagents, run `--once` in the main agent and keep only the action line. A new rule bans hand-written

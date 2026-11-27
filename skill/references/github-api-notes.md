@@ -41,16 +41,20 @@ workflow.
 ### Post-merge pipeline
 
 ```bash
-# All workflow runs for the merge commit (the watcher drops pull_request runs and other branches)
+# All workflow runs for the merge commit (the watcher keeps only base-branch runs from merge events)
 gh api repos/{owner}/{repo}/actions/runs -X GET -f head_sha=<merge-sha> -f per_page=100 -f page=<p>
 
 # Jobs of a failed run, to name the failed job
 gh api repos/{owner}/{repo}/actions/runs/<run-id>/jobs -X GET -f per_page=100 -f page=<p> -f filter=latest
 ```
 
-`--watch-merge-pipeline` waits for these runs and prints one line. A run concluded `action_required`, or a `waiting` run
-whose pending deployment has required reviewers, reports `manual: <workflow>`. A `waiting` run whose pending deployments
-have no reviewers (for example, only an environment wait timer) starts on its own and stays pending:
+`--watch-merge-pipeline` waits for these runs and prints one line. Only runs on the base branch from events the merge
+starts count: `push`, `workflow_run`, `workflow_dispatch`, `dynamic`, `check_suite`, `deployment`, and
+`deployment_status`. Runs from `issue_comment`, `issues`, `schedule` and similar events also land on the merge commit
+right after a merge, but say nothing about it. A run concluded `action_required` reports `manual: <workflow>`, and so
+does a `waiting` run unless every pending deployment has no reviewers and a wait timer that is still running (from
+`wait_timer_started_at`). Such a timer-only wait starts on its own and stays pending; required reviewers, a custom
+protection rule (no reviewers, no timer), or an elapsed timer need someone:
 
 ```bash
 # Pending deployments of a waiting run (reviewers vs. a timer-only wait)
