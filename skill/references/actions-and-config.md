@@ -51,8 +51,8 @@ empty, waits for the base-branch pipeline on that commit, and prints one line:
 A closed unmerged PR skips this step. Cleanup can proceed after a merge; a post-merge failure is reported, not fixed
 automatically. Both hosts keep every result except `failed` stable for 60 seconds before printing it, restarting the
 hold whenever an observed run or pipeline appears, retries, or changes result, so a late `workflow_run` chain or a
-second pipeline on the same commit is not missed. A poll error clears the hold, so a stale success is never printed
-after an unverified window.
+second pipeline on the same commit is not missed. A poll error clears the hold and restarts the 5-minute discovery
+window, so a stale success or an early `no_pipeline` is never printed after an unverified window.
 
 ## Diagnostic playbooks for uncommon actions
 

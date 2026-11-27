@@ -3335,8 +3335,8 @@ class MergePipelineRunTests(unittest.TestCase):
 
     def test_a_string_attempt_is_compared_as_a_number(self):
         runs = [
-            self.merge_run(1, "CI", "completed", "failure", run_attempt="1"),
-            self.merge_run(1, "CI", "completed", "success", run_attempt="2"),
+            self.merge_run(1, "CI", "completed", "failure", run_attempt=9),
+            self.merge_run(1, "CI", "completed", "success", run_attempt="10"),
         ]
 
         self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
@@ -3421,7 +3421,7 @@ class MergePipelineStatusTests(unittest.TestCase):
         run = dict(self.merge_run(1, "CI", "completed", "success"), run_attempt=2)
         with patch.object(watch, "get_workflow_runs_for_sha", return_value=[run]):
             numeric = watch.get_merge_pipeline_status(self.target())["signature"]
-        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[dict(run, run_attempt="2")]):
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[dict(run, run_attempt="02")]):
             textual = watch.get_merge_pipeline_status(self.target())["signature"]
 
         self.assertEqual(numeric, textual)
