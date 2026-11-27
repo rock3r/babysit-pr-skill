@@ -87,8 +87,10 @@ Diagnose a failure with `glab ci view` or `glab ci trace <job id> -R <group>/<pr
 ### Post-merge pipeline
 
 After a merged MR, `--watch-merge-pipeline` resolves the commit that the target branch was updated to, in this order:
-`merge_commit_sha`, `squash_commit_sha`, then the MR `sha`, the last only when the project's `merge_method` is `ff`
-and the MR is not a squash merge (`GET projects/<id>`). Otherwise it re-reads the MR until a merge SHA appears. It
+`merge_commit_sha`, then — only when the project's `merge_method` is `ff` (`GET projects/<id>`) — `squash_commit_sha`
+for a squashed MR or the MR `sha` otherwise. With `merge` or `rebase_merge` the target gets its own commit and
+`squash_commit_sha` names a source-branch commit, so the watcher waits for `merge_commit_sha` rather than watch the
+wrong commit. Otherwise it re-reads the MR until a merge SHA appears. It
 tracks every matching pipeline for that commit on the target branch:
 
 ```bash

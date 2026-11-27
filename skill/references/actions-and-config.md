@@ -34,16 +34,16 @@ values.
 ## Post-merge pipeline
 
 After a merged `stop_pr_closed`, the watch subagent runs `--watch-merge-pipeline` for the same PR/MR. The watcher
-resolves the commit the base branch was updated to (GitHub `mergeCommit.oid`; GitLab `merge_commit_sha`, then
-`squash_commit_sha`, then the MR `sha` on fast-forward projects only), re-reading the PR/MR while that SHA is still
-empty, waits for the base-branch pipeline on that commit, and prints one line:
+resolves the commit the base branch was updated to (GitHub `mergeCommit.oid`; GitLab `merge_commit_sha`, then, on
+fast-forward projects only, `squash_commit_sha` for a squashed MR or the MR `sha` otherwise), re-reading the PR/MR while
+that SHA is still empty, waits for the base-branch pipeline on that commit, and prints one line:
 
 | Line | Meaning | Action |
 |---|---|---|
 | `success` | Every base-branch run/job passed. | Clean up and report. |
 | `failed: <job>` | A run/job failed. | Report the job and the merge commit to the owner. Do not push to the base branch or rerun jobs unless the owner asks. |
 | `canceled` | The pipeline was canceled. | Report to the owner. |
-| `manual: <job>` | A manual job, deployment approval, or `action_required` run blocks the pipeline. | Tell the owner which job needs a person. |
+| `manual: <job>` | A manual job, a deployment approval that requires reviewers, or an `action_required` run blocks the pipeline. A deployment held only by an environment wait timer keeps waiting. | Tell the owner which job needs a person. |
 | `skipped` | The pipeline was skipped by its rules. | Report it; it is not a failure. |
 | `no_pipeline` | No base-branch run appeared within 5 minutes. | Report it. Valid for a repo without base-branch pipelines; otherwise check the CI triggers. |
 | `timeout` | The pipeline was still pending at `--max-session-minutes` (a result already in its hold is printed instead). | Report it; do not keep polling by hand. |

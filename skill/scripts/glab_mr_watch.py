@@ -373,18 +373,16 @@ def retry_job(pr, run_id):
 def collect_merge_pipeline_target(args):
     """Resolve the MR and the base-branch commit to watch after a merge."""
     pr, _mr = resolve_mr(args.pr, repo_override=args.repo)
-    candidates = [pr.get("merge_commit_sha"), pr.get("squash_commit_sha")]
-    # Only a fast-forward merge moves the target branch to the MR head itself. With
-    # any other method the merge commit SHA can lag the merge, so wait for it rather
-    # than watch the head. A squash on a fast-forward project also creates a new
-    # commit, so the head fallback does not apply there either.
-    if (
-        pr.get("merged")
-        and not any(candidates)
-        and not pr.get("squash")
-        and project_merge_method(pr) == "ff"
-    ):
-        candidates.append(pr.get("head_sha"))
+    candidates = [pr.get("merge_commit_sha")]
+    # Only a fast-forward merge puts another field on the target branch: a
+    # squashed MR advances it to `squash_commit_sha`, a non-squashed one to the
+    # MR head. With `merge` or `rebase_merge`, `squash_commit_sha` is a commit on
+    # the source branch and the target gets its own commit, so that field can
+    # lag or name the wrong commit. Wait for `merge_commit_sha` instead.
+    if pr.get("merged") and not any(candidates) and project_merge_method(pr) == "ff":
+        candidates.append(pr.get("squash_commit_sha"))
+        if not pr.get("squash"):
+            candidates.append(pr.get("head_sha"))
     return core.merge_pipeline_target_from_pr(pr, candidates)
 
 

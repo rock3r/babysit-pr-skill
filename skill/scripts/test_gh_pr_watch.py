@@ -3299,6 +3299,24 @@ class MergePipelineRunTests(unittest.TestCase):
 
         self.assertEqual((status["state"], status["job"]), ("manual", "Deploy"))
 
+    def test_a_timer_only_wait_stays_pending(self):
+        # A deployment held only by an environment wait timer starts on its own;
+        # exiting as `manual` would miss the deployment and any later failure.
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "Deploy", "waiting")],
+            waiting_needs_manual=lambda run: False,
+        )
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_a_reviewer_gated_wait_needs_a_human(self):
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "Deploy", "waiting")],
+            waiting_needs_manual=lambda run: True,
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "Deploy"))
+
     def test_a_failure_wins_over_a_waiting_run(self):
         runs = [
             self.merge_run(1, "Build", "completed", "failure"),
@@ -3406,6 +3424,51 @@ class MergePipelineStatusTests(unittest.TestCase):
             status = watch.get_merge_pipeline_status(self.target())
 
         self.assertEqual(status["state"], "success")
+
+    def test_a_timer_only_deployment_wait_is_pending(self):
+        runs = [self.merge_run(1, "Deploy", "waiting")]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "gh_json", return_value=[
+                    {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": []}
+                ]) as api:
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "pending")
+        api.assert_called_once_with(
+            ["api", "repos/owner/repo/actions/runs/1/pending_deployments", "-X", "GET"]
+        )
+
+    def test_a_reviewer_gated_deployment_wait_is_manual(self):
+        runs = [self.merge_run(1, "Deploy", "waiting")]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "gh_json", return_value=[
+                    {"environment": {"name": "prod"}, "reviewers": [{"type": "User"}]}
+                ]):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "Deploy"))
+
+    def test_a_waiting_run_without_pending_deployments_stays_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_an_unreadable_pending_deployment_raises_for_a_retry(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", side_effect=watch.GhCommandError("boom")):
+            with self.assertRaises(watch.GhCommandError):
+                watch.waiting_run_needs_manual_approval("owner/repo", run)
+
+    def test_a_waiting_run_with_only_a_wait_timer_is_not_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": []}]):
+            self.assertFalse(watch.waiting_run_needs_manual_approval("owner/repo", run))
 
     def test_the_signature_changes_when_a_finished_run_appears_or_retries(self):
         first = self.merge_run(1, "CI", "completed", "success")

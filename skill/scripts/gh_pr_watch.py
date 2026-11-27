@@ -951,8 +951,37 @@ def merge_pipeline_runs(runs):
     return list(selected.values()) + anonymous
 
 
-def summarize_merge_pipeline_runs(runs):
-    """Aggregate the workflow runs for a commit into one post-merge pipeline state."""
+def waiting_run_needs_manual_approval(repo, run):
+    """Whether a `waiting` run is blocked on a person rather than a wait timer.
+
+    GitHub reports a run held by an environment protection rule as `waiting`.
+    With required reviewers it needs a person, but a deployment with only a wait
+    timer starts on its own, so it must keep the watcher polling instead of
+    reporting `manual` and exiting before the deployment runs. A failed lookup
+    raises so the watch loop retries; an empty pending list is not a deployment
+    approval, so it stays manual and preserves the previous behavior.
+    """
+    run_id = run.get("id")
+    if not run_id:
+        return True
+    pending = gh_json(
+        ["api", f"repos/{repo}/actions/runs/{run_id}/pending_deployments", "-X", "GET"]
+    )
+    if not isinstance(pending, list) or not pending:
+        return True
+    return any(
+        isinstance(deployment, dict) and bool(deployment.get("reviewers"))
+        for deployment in pending
+    )
+
+
+def summarize_merge_pipeline_runs(runs, waiting_needs_manual=None):
+    """Aggregate the workflow runs for a commit into one post-merge pipeline state.
+
+    `waiting_needs_manual(run)` separates a waiting run that needs a person from
+    one waiting on an environment timer. Without it, every `waiting` run is
+    manual, which is the safe default when the caller cannot inspect deployments.
+    """
     latest = merge_pipeline_runs(runs)
     latest.sort(key=lambda run: (str(run.get("name") or ""), str(run.get("id") or "")))
     # The signature covers every observed run, not just the subset a state
@@ -962,14 +991,19 @@ def summarize_merge_pipeline_runs(runs):
     if not latest:
         return {"state": "missing", "runs": [], "signature": signature}
 
-    waiting = [
+    manual = [
         run for run in latest
-        if str(run.get("status") or "") == "waiting"
-        or str(run.get("conclusion") or "") in MERGE_PIPELINE_MANUAL_CONCLUSIONS
+        if str(run.get("conclusion") or "") in MERGE_PIPELINE_MANUAL_CONCLUSIONS
+        or (
+            str(run.get("status") or "") == "waiting"
+            and (waiting_needs_manual is None or waiting_needs_manual(run))
+        )
     ]
+    # A `waiting` run that is not manual is a timer-only deployment: it advances
+    # on its own, so the pipeline is still pending.
     pending = [
         run for run in latest
-        if str(run.get("status") or "") != "completed" and run not in waiting
+        if str(run.get("status") or "") != "completed" and run not in manual
     ]
     if pending:
         return {"state": "pending", "runs": latest, "signature": signature}
@@ -990,16 +1024,16 @@ def summarize_merge_pipeline_runs(runs):
 
     undecided = [
         run for run in latest
-        if run not in waiting and not str(run.get("conclusion") or "")
+        if run not in manual and not str(run.get("conclusion") or "")
     ]
     if undecided:
         return {"state": "pending", "runs": latest, "signature": signature}
 
-    if waiting:
-        run = waiting[0]
+    if manual:
+        run = manual[0]
         return {
             "state": "manual",
-            "runs": waiting,
+            "runs": manual,
             "job": str(run.get("name") or run.get("display_title") or "pipeline"),
             "signature": signature,
         }
@@ -1096,7 +1130,12 @@ def get_merge_pipeline_status(target):
         target["repo"], target["merge_sha"], event=None, branch=None
     )
     runs = [run for run in runs if is_base_branch_workflow_run(run, target["base_branch"])]
-    status = summarize_merge_pipeline_runs(runs)
+    status = summarize_merge_pipeline_runs(
+        runs,
+        waiting_needs_manual=lambda run: waiting_run_needs_manual_approval(
+            target["repo"], run
+        ),
+    )
     if status["state"] == "failed" and status.get("runs"):
         status["job"] = first_failed_job_name(target["repo"], status["runs"][0])
     return status

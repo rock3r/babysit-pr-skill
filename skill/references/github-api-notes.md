@@ -48,9 +48,17 @@ gh api repos/{owner}/{repo}/actions/runs -X GET -f head_sha=<merge-sha> -f per_p
 gh api repos/{owner}/{repo}/actions/runs/<run-id>/jobs -X GET -f per_page=100 -f page=<p> -f filter=latest
 ```
 
-`--watch-merge-pipeline` waits for these runs and prints one line. A run in `waiting` (deployment approval) or concluded
-`action_required` reports `manual: <workflow>`. A failed run reports its first failed job, or the workflow name when the
-jobs lookup fails. Every result except `failed` is held for 60 seconds to catch a late `workflow_run`, and the hold
+`--watch-merge-pipeline` waits for these runs and prints one line. A run concluded `action_required`, or a `waiting` run
+whose pending deployment requires reviewers, reports `manual: <workflow>`. A `waiting` run held only by an environment
+wait timer starts on its own and stays pending:
+
+```bash
+# Pending deployments of a waiting run (reviewers vs. a timer-only wait)
+gh api repos/{owner}/{repo}/actions/runs/<run-id>/pending_deployments -X GET
+```
+
+A failed run reports its first failed job, or the workflow name when the jobs lookup fails. Every result except `failed`
+is held for 60 seconds to catch a late `workflow_run`, and the hold
 restarts whenever an observed run appears, retries, or changes result; no run within 5 minutes reports `no_pipeline`.
 Independent runs of one workflow all count, so a failed or canceled run is not hidden by a newer successful
 invocation; a rerun replaces its earlier attempt. A `neutral` conclusion is a pass. A poll error clears the hold, and a

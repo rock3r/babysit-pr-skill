@@ -606,9 +606,11 @@ class MergePipelineTests(unittest.TestCase):
 
         self.assertEqual(target["merge_sha"], "m" * 40)
 
-    def test_the_squash_commit_is_the_next_choice(self):
+    def test_the_squash_commit_is_the_next_choice_on_a_fast_forward_project(self):
         pr = {
             "merged": True,
+            "host": HOST,
+            "project_id": 11,
             "repo": PATH,
             "base_branch": "main",
             "head_sha": "h" * 40,
@@ -616,10 +618,35 @@ class MergePipelineTests(unittest.TestCase):
             "squash_commit_sha": "s" * 40,
         }
 
-        with patch.object(glab, "resolve_mr", return_value=(pr, {})):
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                patch.object(glab, "glab_api", return_value={"merge_method": "ff"}) as api:
             target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
 
         self.assertEqual(target["merge_sha"], "s" * 40)
+        api.assert_called_once_with(HOST, "projects/11")
+
+    def test_a_squash_commit_outside_a_fast_forward_project_is_not_the_target(self):
+        # With merge or rebase_merge the target gets its own commit and
+        # `squash_commit_sha` is a source-branch commit. Watching it would miss
+        # the real target pipeline, so wait for `merge_commit_sha` instead.
+        pr = {
+            "merged": True,
+            "host": HOST,
+            "project_id": 11,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "s" * 40,
+            "squash": True,
+        }
+
+        for merge_method in ("merge", "rebase_merge"):
+            with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                    patch.object(glab, "glab_api", return_value={"merge_method": merge_method}):
+                target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+            self.assertEqual(target["merge_sha"], "", merge_method)
 
     def _head_only_target(self, merge_method, squash=False):
         pr = {
@@ -637,10 +664,7 @@ class MergePipelineTests(unittest.TestCase):
         with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
                 patch.object(glab, "glab_api", return_value={"merge_method": merge_method}) as api:
             target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
-        if squash:
-            api.assert_not_called()
-        else:
-            api.assert_called_once_with(HOST, "projects/11")
+        api.assert_called_once_with(HOST, "projects/11")
         return target
 
     def test_the_head_sha_is_the_last_choice_on_a_fast_forward_project(self):
