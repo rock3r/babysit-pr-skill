@@ -1012,6 +1012,33 @@ def first_failed_job_name(repo, run):
     return str(failed[0].get("name") or "") or workflow_name
 
 
+def merge_pipeline_run_signature(runs):
+    """Identity of the observed runs, so a late run restarts the settle hold.
+
+    The aggregate state can stay `success` while a workflow that appeared and
+    finished between two polls joins the set. Tracking each run's id, attempt,
+    and result catches that, so a later deployment run is never missed.
+    """
+    return tuple(sorted(
+        (
+            str(run.get("id") or ""),
+            str(run.get("run_attempt") or ""),
+            str(run.get("status") or ""),
+            str(run.get("conclusion") or ""),
+        )
+        for run in runs or []
+        if isinstance(run, dict)
+    ))
+
+
+def merge_pipeline_settle_key(status):
+    """What the settle hold compares between polls: the state and the run set."""
+    signature = status.get("signature")
+    if signature is None:
+        signature = merge_pipeline_run_signature(status.get("runs") or [])
+    return (str(status.get("state") or ""), signature)
+
+
 def get_merge_pipeline_status(target):
     """One post-merge state for the base-branch runs on the merge commit."""
     runs = get_workflow_runs_for_sha(
@@ -1019,6 +1046,10 @@ def get_merge_pipeline_status(target):
     )
     runs = [run for run in runs if is_base_branch_workflow_run(run, target["base_branch"])]
     status = summarize_merge_pipeline_runs(runs)
+    # The signature covers every observed run, not just the subset the state
+    # reports, so a new run restarts the settle hold even when the state stays
+    # the same (for example, an already-finished downstream deployment run).
+    status["signature"] = merge_pipeline_run_signature(latest_runs_by_workflow(runs))
     if status["state"] == "failed" and status.get("runs"):
         status["job"] = first_failed_job_name(target["repo"], status["runs"][0])
     return status
@@ -3035,13 +3066,13 @@ def run_watch_merge_pipeline(args):
     started_at = time.time()
     no_pipeline_since = None
     # A non-failed terminal result is held stable before printing, as a late
-    # workflow_run can still start. `held` is (latest status, held since).
+    # workflow_run can still start. `held` is (settle key, latest status, held since).
     held = None
     max_session_seconds = args.max_session_minutes * 60
     while True:
         now = time.time()
         if now - started_at > max_session_seconds:
-            print_merge_pipeline_result(held[0] if held else {"state": "timeout"})
+            print_merge_pipeline_result(held[1] if held else {"state": "timeout"})
             return 0
         try:
             if not target["merge_sha"]:
@@ -3067,8 +3098,9 @@ def run_watch_merge_pipeline(args):
 
         no_pipeline_since = None
         if state != "failed" and MERGE_PIPELINE_SETTLE_SECONDS:
-            since = held[1] if held and held[0].get("state") == state else now
-            held = (status, since)
+            settle_key = merge_pipeline_settle_key(status)
+            since = held[2] if held and held[0] == settle_key else now
+            held = (settle_key, status, since)
             if now - since < MERGE_PIPELINE_SETTLE_SECONDS:
                 time.sleep(args.poll_seconds)
                 continue

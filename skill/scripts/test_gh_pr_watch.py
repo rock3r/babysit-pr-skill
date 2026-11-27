@@ -3357,6 +3357,16 @@ class MergePipelineStatusTests(unittest.TestCase):
 
         self.assertEqual(status["state"], "success")
 
+    def test_the_signature_changes_when_a_finished_run_appears_or_retries(self):
+        first = self.merge_run(1, "CI", "completed", "success")
+        second = self.merge_run(2, "Deploy", "completed", "success")
+        signatures = []
+        for runs in ([first], [first, second], [dict(first, run_attempt=2), second]):
+            with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
+                signatures.append(watch.get_merge_pipeline_status(self.target())["signature"])
+
+        self.assertEqual(len(set(signatures)), 3)
+
     def test_a_failed_run_reports_the_failed_job(self):
         runs = [self.merge_run(1, "CI", "completed", "failure")]
 
@@ -3412,6 +3422,15 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         values = {"pr": "auto", "repo": None, "poll_seconds": 30, "max_session_minutes": 90}
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    @staticmethod
+    def merge_run(run_id, run_attempt=1, status="completed", conclusion="success"):
+        return {
+            "id": run_id,
+            "run_attempt": run_attempt,
+            "status": status,
+            "conclusion": conclusion,
+        }
 
     def target(self):
         return {"repo": "owner/repo", "base_branch": "main", "merge_sha": "m" * 40}
@@ -3509,6 +3528,38 @@ class RunWatchMergePipelineTests(unittest.TestCase):
 
         self.assertEqual(out, "canceled\n")
         self.assertEqual(getter.call_count, 5)
+
+    def test_a_new_completed_run_restarts_the_settle_grace(self):
+        # The state stays "success" but a downstream run appears already done.
+        # The hold must restart, or a later deployment run is missed.
+        first = self.merge_run(1)
+        second = self.merge_run(2)
+        statuses = [
+            {"state": "success", "runs": [first]},
+            {"state": "success", "runs": [first, second]},
+            {"state": "success", "runs": [first, second]},
+            {"state": "success", "runs": [first, second]},
+        ]
+
+        out, _collector, getter = self.run_clocked(statuses)
+
+        self.assertEqual(out, "success\n")
+        self.assertEqual(getter.call_count, 4)
+
+    def test_a_rerun_attempt_restarts_the_settle_grace(self):
+        first = self.merge_run(1, run_attempt=1)
+        retried = self.merge_run(1, run_attempt=2)
+        statuses = [
+            {"state": "success", "runs": [first]},
+            {"state": "success", "runs": [retried]},
+            {"state": "success", "runs": [retried]},
+            {"state": "success", "runs": [retried]},
+        ]
+
+        out, _collector, getter = self.run_clocked(statuses)
+
+        self.assertEqual(out, "success\n")
+        self.assertEqual(getter.call_count, 4)
 
     def test_no_hold_when_the_settle_time_is_zero(self):
         with patch.object(watch, "MERGE_PIPELINE_SETTLE_SECONDS", 0):
