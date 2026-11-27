@@ -10,12 +10,14 @@ This is a minor release: it adds a post-merge pipeline mode and the subagent wat
 
 - `--watch-merge-pipeline` on both watchers. After a merged PR/MR, it waits for the base-branch pipeline on the merge
   commit and prints one bare line: `success`, `failed: <job>`, `canceled`, `manual: <job>`, `skipped`, `no_pipeline`, or
-  `timeout`. GitHub reads `mergeCommit.oid` and ignores `pull_request` runs and runs from other branches. GitLab tries
-  `merge_commit_sha`, then `squash_commit_sha`, then the MR `sha` (fast-forward projects only), re-reads an empty merge
-  SHA, and keeps only pipelines on the target branch. GitHub holds every non-failed result for 60 seconds, restarting
-  the hold whenever an observed run appears, retries, or changes result, to catch a late
-  `workflow_run`; an `action_required` run reports `manual`. A
-  failed post-merge pipeline is report-only: the watcher never pushes to the base branch or reruns base-branch jobs.
+  `timeout`. GitHub reads `mergeCommit.oid` and ignores `pull_request` runs, runs from other branches, and runs with no
+  branch. GitLab tries `merge_commit_sha`, then `squash_commit_sha`, then the MR `sha` (fast-forward, non-squash
+  projects only), re-reads an empty merge SHA, and keeps only pipelines on the target branch. Both hosts hold every
+  non-failed result for 60 seconds, restarting the hold whenever an observed run or pipeline appears, retries, or
+  changes result, to catch a late `workflow_run`; an `action_required` run reports `manual`. Independent invocations of
+  one workflow all count, while a rerun replaces its earlier attempt. A job name is flattened to one line before it is
+  printed. A failed post-merge pipeline is report-only: the watcher never pushes to the base branch or reruns
+  base-branch jobs.
 - `SKILL.md`: run every blocking wait in a subagent at the lowest model tier and lowest reasoning effort; the subagent
   returns one action line plus only the identifiers the main agent needs, then the main agent acts and starts a new
   subagent. Without subagents, run `--once` in the main agent and keep only the action line. A new rule bans hand-written

@@ -621,7 +621,7 @@ class MergePipelineTests(unittest.TestCase):
 
         self.assertEqual(target["merge_sha"], "s" * 40)
 
-    def _head_only_target(self, merge_method):
+    def _head_only_target(self, merge_method, squash=False):
         pr = {
             "merged": True,
             "host": HOST,
@@ -631,16 +631,23 @@ class MergePipelineTests(unittest.TestCase):
             "head_sha": "h" * 40,
             "merge_commit_sha": "",
             "squash_commit_sha": "",
+            "squash": squash,
         }
 
         with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
                 patch.object(glab, "glab_api", return_value={"merge_method": merge_method}) as api:
             target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
-        api.assert_called_once_with(HOST, "projects/11")
+        if squash:
+            api.assert_not_called()
+        else:
+            api.assert_called_once_with(HOST, "projects/11")
         return target
 
     def test_the_head_sha_is_the_last_choice_on_a_fast_forward_project(self):
         self.assertEqual(self._head_only_target("ff")["merge_sha"], "h" * 40)
+
+    def test_a_squashed_fast_forward_merge_waits_instead_of_watching_the_head(self):
+        self.assertEqual(self._head_only_target("ff", squash=True)["merge_sha"], "")
 
     def test_a_merge_commit_project_waits_for_the_merge_sha(self):
         self.assertEqual(self._head_only_target("merge")["merge_sha"], "")
@@ -739,6 +746,22 @@ class MergePipelineTests(unittest.TestCase):
 
         self.assertEqual((status["state"], status["job"]), ("manual", "pipeline"))
 
+    def test_a_second_pipeline_changes_the_signature_and_state(self):
+        first = {"id": 5, "status": "success", "ref": "main"}
+        later = {"id": 6, "status": "running", "ref": "main"}
+
+        with patch.object(glab, "glab_api_list", return_value=[first]):
+            before = glab.get_merge_pipeline_status(self.target())
+        with patch.object(glab, "glab_api_list", return_value=[first, later]):
+            after = glab.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(before["state"], "success")
+        self.assertEqual(after["state"], "pending")
+        self.assertNotEqual(
+            core.merge_pipeline_settle_key(before),
+            core.merge_pipeline_settle_key(after),
+        )
+
     def test_a_missing_pipeline_falls_back_to_a_sha_only_lookup(self):
         calls = []
 
@@ -765,11 +788,13 @@ class MergePipelineTests(unittest.TestCase):
         payload = mr_payload(state="merged")
         payload["merge_commit_sha"] = "m" * 40
         payload["squash_commit_sha"] = "s" * 40
+        payload["squash"] = True
 
         pr = glab.normalize_mr(payload, HOST)
 
         self.assertEqual(pr["merge_commit_sha"], "m" * 40)
         self.assertEqual(pr["squash_commit_sha"], "s" * 40)
+        self.assertTrue(pr["squash"])
 
 
 class ConfigTests(unittest.TestCase):
@@ -801,7 +826,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIs(core.activate_config, glab.activate_config)
             self.assertIs(core.collect_merge_pipeline_target, glab.collect_merge_pipeline_target)
             self.assertIs(core.get_merge_pipeline_status, glab.get_merge_pipeline_status)
-            self.assertEqual(core.MERGE_PIPELINE_SETTLE_SECONDS, 0)
+            self.assertEqual(core.MERGE_PIPELINE_SETTLE_SECONDS, 60)
             mock_main.assert_called_once_with()
 
 

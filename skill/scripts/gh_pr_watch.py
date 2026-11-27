@@ -263,8 +263,8 @@ MERGE_PIPELINE_DISCOVERY_GRACE_SECONDS = 5 * 60
 
 # A downstream workflow_run can start just after the push workflows finish.
 # Keep a non-failed terminal result stable for this long before reporting it, so
-# a late workflow never makes the line wrong. GitLab sets this to 0: its pipeline
-# status is already final.
+# a late workflow never makes the line wrong. GitLab uses the same window: a
+# second pipeline for the commit can start after the first one finished.
 MERGE_PIPELINE_SETTLE_SECONDS = 60
 
 # GitHub conclusions that make the post-merge pipeline a failure. Cancellation is
@@ -281,6 +281,13 @@ MERGE_PIPELINE_MANUAL_CONCLUSIONS = {
 }
 MERGE_PIPELINE_CANCELED_CONCLUSIONS = {
     "cancelled",
+}
+# Completed conclusions that count as a pass. `neutral` is GitHub's explicit
+# "finished without a verdict" result; treating it as a pass matches how a check
+# run with a neutral conclusion is displayed as non-failing.
+MERGE_PIPELINE_SUCCESS_CONCLUSIONS = {
+    "success",
+    "neutral",
 }
 
 # Codex keeps one "Codex Review Summary" status table on the PR and edits it on every review.
@@ -881,7 +888,9 @@ def is_base_branch_workflow_run(run, base_branch):
     if str(run.get("event") or "") in ("pull_request", "pull_request_target"):
         return False
     head_branch = str(run.get("head_branch") or "")
-    return not head_branch or head_branch == base_branch
+    # A run with no branch is not provably on the base branch. Watching it could
+    # report a pipeline from another ref, so leave it out rather than guess.
+    return bool(head_branch) and head_branch == base_branch
 
 
 def merge_pipeline_target_from_pr(pr, sha_candidates):
@@ -911,9 +920,32 @@ def collect_merge_pipeline_target(args):
     return merge_pipeline_target_from_pr(pr, [pr.get("merge_commit_sha")])
 
 
+def merge_pipeline_runs(runs):
+    """Every observed post-merge run, one entry per run id.
+
+    Independent invocations of the same workflow on one commit (for example a
+    `push` run and a `workflow_dispatch` run) are distinct runs and must all
+    count. A rerun keeps the same run id and only bumps `run_attempt`, so the
+    newer attempt replaces the older one instead of adding a run.
+    """
+    selected = {}
+    anonymous = []
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        run_id = str(run.get("id") or "")
+        if not run_id:
+            anonymous.append(run)
+            continue
+        prev = selected.get(run_id)
+        if prev is None or (run.get("run_attempt") or 0) >= (prev.get("run_attempt") or 0):
+            selected[run_id] = run
+    return list(selected.values()) + anonymous
+
+
 def summarize_merge_pipeline_runs(runs):
     """Aggregate the workflow runs for a commit into one post-merge pipeline state."""
-    latest = latest_runs_by_workflow(runs)
+    latest = merge_pipeline_runs(runs)
     latest.sort(key=lambda run: (str(run.get("name") or ""), str(run.get("id") or "")))
     # The signature covers every observed run, not just the subset a state
     # reports, so a new run restarts the settle hold even when the state stays
@@ -967,7 +999,16 @@ def summarize_merge_pipeline_runs(runs):
     if all(str(run.get("conclusion") or "") == "skipped" for run in latest):
         return {"state": "skipped", "runs": latest, "signature": signature}
 
-    return {"state": "success", "runs": latest, "signature": signature}
+    if all(
+        str(run.get("conclusion") or "") in MERGE_PIPELINE_SUCCESS_CONCLUSIONS
+        or str(run.get("conclusion") or "") == "skipped"
+        for run in latest
+    ):
+        return {"state": "success", "runs": latest, "signature": signature}
+
+    # A completed run with a conclusion outside the known sets is not a pass.
+    # Wait for a state this watcher understands rather than report success.
+    return {"state": "pending", "runs": latest, "signature": signature}
 
 
 def get_workflow_run_jobs(repo, run_id):
@@ -1053,13 +1094,26 @@ def get_merge_pipeline_status(target):
     return status
 
 
+_ONELINE_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def one_line_text(value):
+    """Collapse any text to a single safe output line.
+
+    Workflow and job names come from the repository and can contain newlines or
+    terminal escapes. The watcher promises one bare line, so control characters
+    become spaces and runs of whitespace collapse.
+    """
+    return " ".join(_ONELINE_CONTROL_CHARS.sub(" ", str(value or "")).split())
+
+
 def format_merge_pipeline_result(status):
     """The single line that --watch-merge-pipeline prints."""
     state = str(status.get("state") or "")
     if state == "failed":
-        return f"failed: {status.get('job') or 'pipeline'}"
+        return f"failed: {one_line_text(status.get('job')) or 'pipeline'}"
     if state == "manual":
-        return f"manual: {status.get('job') or 'pipeline'}"
+        return f"manual: {one_line_text(status.get('job')) or 'pipeline'}"
     if state in ("success", "canceled", "no_pipeline", "skipped", "timeout"):
         return state
     raise ValueError(f"unknown merge pipeline state: {state or 'empty'}")
@@ -3080,6 +3134,9 @@ def run_watch_merge_pipeline(args):
             status = get_merge_pipeline_status(target) if target["merge_sha"] else {"state": "missing"}
         except (GhCommandError, RuntimeError) as err:
             sys.stderr.write(f"gh_pr_watch.py merge pipeline poll error (retrying): {err}\n")
+            # The last good poll is no longer a settled observation: an outage can
+            # hide a late failing run, so the settle window must start again.
+            held = None
             time.sleep(args.poll_seconds)
             continue
 

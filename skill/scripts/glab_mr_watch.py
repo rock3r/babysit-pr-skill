@@ -184,6 +184,9 @@ def normalize_mr(mr, host):
         "base_branch": str(mr.get("target_branch") or ""),
         "merge_commit_sha": str(mr.get("merge_commit_sha") or ""),
         "squash_commit_sha": str(mr.get("squash_commit_sha") or ""),
+        # A squash merge creates a new commit, so the MR head is not on the target
+        # branch even when the project only allows fast-forward merges.
+        "squash": bool(mr.get("squash") or mr.get("squash_on_merge")),
         "state": MR_STATE_MAP.get(raw_state, raw_state.upper()),
         "merged": raw_state == "merged",
         "closed": raw_state not in ("opened", "locked"),
@@ -373,8 +376,14 @@ def collect_merge_pipeline_target(args):
     candidates = [pr.get("merge_commit_sha"), pr.get("squash_commit_sha")]
     # Only a fast-forward merge moves the target branch to the MR head itself. With
     # any other method the merge commit SHA can lag the merge, so wait for it rather
-    # than watch the head.
-    if pr.get("merged") and not any(candidates) and project_merge_method(pr) == "ff":
+    # than watch the head. A squash on a fast-forward project also creates a new
+    # commit, so the head fallback does not apply there either.
+    if (
+        pr.get("merged")
+        and not any(candidates)
+        and not pr.get("squash")
+        and project_merge_method(pr) == "ff"
+    ):
         candidates.append(pr.get("head_sha"))
     return core.merge_pipeline_target_from_pr(pr, candidates)
 
@@ -423,8 +432,8 @@ def pipeline_job_name_for(host, project_id, pipeline_id, statuses, require_block
     return first_pipeline_job_name(jobs, statuses, require_blocking=require_blocking)
 
 
-def find_merge_pipeline(host, project_id, merge_sha, base_branch):
-    """The newest base-branch pipeline for the merge commit, or None."""
+def find_merge_pipelines(host, project_id, merge_sha, base_branch):
+    """Every base-branch pipeline for the merge commit, or an empty list."""
     endpoint = (
         f"projects/{project_ref(project_id)}/pipelines"
         f"?sha={quote(merge_sha, safe='')}&ref={quote(base_branch, safe='')}"
@@ -433,18 +442,33 @@ def find_merge_pipeline(host, project_id, merge_sha, base_branch):
         item for item in glab_api_list(host, endpoint)
         if isinstance(item, dict) and str(item.get("ref") or "") == base_branch
     ]
-    pipeline = newest_pipeline(matching)
-    if pipeline is not None:
-        return pipeline
+    if matching:
+        return matching
 
     # Some instances ignore `ref` when `sha` is present. Filter the SHA-only
     # answer ourselves rather than watching a pipeline from another ref.
     endpoint = f"projects/{project_ref(project_id)}/pipelines?sha={quote(merge_sha, safe='')}"
-    fallback = [
+    return [
         item for item in glab_api_list(host, endpoint)
         if isinstance(item, dict) and str(item.get("ref") or "") == base_branch
     ]
-    return newest_pipeline(fallback)
+
+
+def find_merge_pipeline(host, project_id, merge_sha, base_branch):
+    """The newest base-branch pipeline for the merge commit, or None."""
+    return newest_pipeline(find_merge_pipelines(host, project_id, merge_sha, base_branch))
+
+
+def merge_pipeline_signature(pipelines):
+    """Identity of every observed pipeline, so a late pipeline restarts the hold."""
+    return tuple(sorted(
+        (
+            str(pipeline.get("id") or ""),
+            str(pipeline.get("status") or ""),
+        )
+        for pipeline in pipelines or []
+        if isinstance(pipeline, dict)
+    ))
 
 
 def get_merge_pipeline_status(target):
@@ -455,13 +479,15 @@ def get_merge_pipeline_status(target):
     if not project_id:
         raise ValueError("unable to determine the GitLab project for the merged merge request")
 
-    pipeline = find_merge_pipeline(host, project_id, target["merge_sha"], target["base_branch"])
+    pipelines = find_merge_pipelines(host, project_id, target["merge_sha"], target["base_branch"])
+    signature = merge_pipeline_signature(pipelines)
+    pipeline = newest_pipeline(pipelines)
     if pipeline is None:
-        return {"state": "missing", "runs": []}
+        return {"state": "missing", "runs": [], "signature": signature}
 
     status = str(pipeline.get("status") or "")
     if status == "success":
-        return {"state": "success", "pipeline": pipeline}
+        return {"state": "success", "pipeline": pipeline, "signature": signature}
     if status == "failed":
         return {
             "state": "failed",
@@ -469,11 +495,12 @@ def get_merge_pipeline_status(target):
                 host, project_id, pipeline["id"], {"failed"}, require_blocking=True
             ),
             "pipeline": pipeline,
+            "signature": signature,
         }
     if status == "canceled":
-        return {"state": "canceled", "pipeline": pipeline}
+        return {"state": "canceled", "pipeline": pipeline, "signature": signature}
     if status == "skipped":
-        return {"state": "skipped", "pipeline": pipeline}
+        return {"state": "skipped", "pipeline": pipeline, "signature": signature}
     if status in ("manual", "blocked"):
         return {
             "state": "manual",
@@ -481,8 +508,9 @@ def get_merge_pipeline_status(target):
                 host, project_id, pipeline["id"], {"manual"}, require_blocking=True
             ),
             "pipeline": pipeline,
+            "signature": signature,
         }
-    return {"state": "pending", "pipeline": pipeline}
+    return {"state": "pending", "pipeline": pipeline, "signature": signature}
 
 
 # --- Review items -------------------------------------------------------------------
@@ -730,7 +758,6 @@ def main():
     core.activate_config = activate_config
     core.collect_merge_pipeline_target = collect_merge_pipeline_target
     core.get_merge_pipeline_status = get_merge_pipeline_status
-    core.MERGE_PIPELINE_SETTLE_SECONDS = 0
     return core.main()
 
 

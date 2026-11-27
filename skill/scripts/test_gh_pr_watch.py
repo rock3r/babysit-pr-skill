@@ -3233,9 +3233,11 @@ class MergePipelineTargetTests(unittest.TestCase):
 
 class MergePipelineRunTests(unittest.TestCase):
     @staticmethod
-    def merge_run(run_id, name, status, conclusion="", workflow_id=None, event="push", head_branch="main"):
+    def merge_run(run_id, name, status, conclusion="", workflow_id=None, event="push", head_branch="main",
+                  run_attempt=1):
         return {
             "id": run_id,
+            "run_attempt": run_attempt,
             "name": name,
             "workflow_id": workflow_id or name,
             "status": status,
@@ -3313,13 +3315,30 @@ class MergePipelineRunTests(unittest.TestCase):
 
         self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "pending")
 
-    def test_only_the_latest_run_of_a_workflow_counts(self):
+    def test_independent_runs_of_a_workflow_all_count(self):
+        # A push run and a workflow_dispatch run of the same workflow are separate
+        # runs, not a rerun. The older failure must not be hidden by the newer pass.
         runs = [
             self.merge_run(1, "CI", "completed", "failure", workflow_id=10),
             self.merge_run(2, "CI", "completed", "success", workflow_id=10),
         ]
 
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "failed")
+
+    def test_a_rerun_attempt_replaces_the_earlier_attempt(self):
+        runs = [
+            self.merge_run(1, "CI", "completed", "failure", run_attempt=1),
+            self.merge_run(1, "CI", "completed", "success", run_attempt=2),
+        ]
+
         self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
+
+    def test_an_unknown_conclusion_waits_instead_of_reporting_success(self):
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "CI", "completed", "mystery")]
+        )
+
+        self.assertEqual(status["state"], "pending")
 
     def test_a_completed_run_without_a_conclusion_waits(self):
         status = watch.summarize_merge_pipeline_runs([self.merge_run(1, "CI", "completed", "")])
@@ -3350,6 +3369,19 @@ class MergePipelineStatusTests(unittest.TestCase):
             self.merge_run(2, "CI", "completed", "failure", event="pull_request_target"),
             self.merge_run(3, "CI", "completed", "failure", head_branch="release"),
             self.merge_run(4, "CI", "completed", "success"),
+        ]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "success")
+
+    def test_runs_without_a_branch_are_ignored(self):
+        # An empty head_branch cannot be proven to be the base branch. A failed
+        # run from an unknown ref must not turn the post-merge result red.
+        runs = [
+            self.merge_run(1, "CI", "completed", "failure", head_branch=""),
+            self.merge_run(2, "CI", "completed", "success"),
         ]
 
         with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
@@ -3428,6 +3460,13 @@ class MergePipelineOutputTests(unittest.TestCase):
     def test_an_unknown_state_is_an_error(self):
         with self.assertRaises(ValueError):
             watch.format_merge_pipeline_result({"state": "surprise"})
+
+    def test_job_names_are_sanitized_to_one_line(self):
+        line = watch.format_merge_pipeline_result(
+            {"state": "failed", "job": "build\nfake line\x1b[31m\tand more"}
+        )
+
+        self.assertEqual(line, "failed: build fake line [31m and more")
 
 
 class RunWatchMergePipelineTests(unittest.TestCase):
@@ -3526,6 +3565,20 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         out, _collector, _getter = self.run_clocked(statuses, max_session_minutes=1)
 
         self.assertEqual(out, "success\n")
+
+    def test_a_poll_error_invalidates_the_held_result(self):
+        # Success at t=0, then the API fails until the session limit. The stale
+        # success must not be printed as if the settle window had completed.
+        statuses = [
+            {"state": "success"},
+            watch.GhCommandError("boom"),
+            watch.GhCommandError("boom"),
+            watch.GhCommandError("boom"),
+        ]
+
+        out, _collector, _getter = self.run_clocked(statuses, max_session_minutes=1)
+
+        self.assertEqual(out, "timeout\n")
 
     def test_an_empty_merge_sha_is_re_resolved(self):
         empty = dict(self.target(), merge_sha="")
