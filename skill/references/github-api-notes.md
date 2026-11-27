@@ -50,7 +50,8 @@ gh api repos/{owner}/{repo}/actions/runs/<run-id>/jobs -X GET -f per_page=100 -f
 
 `--watch-merge-pipeline` waits for these runs and prints one line. A run in `waiting` (deployment approval) or concluded
 `action_required` reports `manual: <workflow>`. A failed run reports its first failed job, or the workflow name when the
-jobs lookup fails. Every result except `failed` is held for 60 seconds to catch a late `workflow_run`; no run within 5
+jobs lookup fails. Every result except `failed` is held for 60 seconds to catch a late `workflow_run`, and the hold
+restarts whenever an observed run appears, retries, or changes result; no run within 5
 minutes reports `no_pipeline`. An empty `mergeCommit.oid` is re-read on each poll until it appears.
 
 ### Failed log inspection

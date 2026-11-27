@@ -3367,6 +3367,20 @@ class MergePipelineStatusTests(unittest.TestCase):
 
         self.assertEqual(len(set(signatures)), 3)
 
+    def test_the_signature_covers_runs_the_state_filters_out(self):
+        canceled = self.merge_run(1, "CI", "completed", "cancelled")
+        later = self.merge_run(2, "Deploy", "completed", "success")
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[canceled]):
+            before = watch.get_merge_pipeline_status(self.target())
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[canceled, later]):
+            after = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((before["state"], after["state"]), ("canceled", "canceled"))
+        self.assertNotEqual(
+            watch.merge_pipeline_settle_key(before),
+            watch.merge_pipeline_settle_key(after),
+        )
+
     def test_a_failed_run_reports_the_failed_job(self):
         runs = [self.merge_run(1, "CI", "completed", "failure")]
 
@@ -3428,6 +3442,8 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         return {
             "id": run_id,
             "run_attempt": run_attempt,
+            "workflow_id": run_id,
+            "name": f"workflow-{run_id}",
             "status": status,
             "conclusion": conclusion,
         }
@@ -3535,10 +3551,10 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         first = self.merge_run(1)
         second = self.merge_run(2)
         statuses = [
-            {"state": "success", "runs": [first]},
-            {"state": "success", "runs": [first, second]},
-            {"state": "success", "runs": [first, second]},
-            {"state": "success", "runs": [first, second]},
+            watch.summarize_merge_pipeline_runs([first]),
+            watch.summarize_merge_pipeline_runs([first, second]),
+            watch.summarize_merge_pipeline_runs([first, second]),
+            watch.summarize_merge_pipeline_runs([first, second]),
         ]
 
         out, _collector, getter = self.run_clocked(statuses)
@@ -3550,10 +3566,10 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         first = self.merge_run(1, run_attempt=1)
         retried = self.merge_run(1, run_attempt=2)
         statuses = [
-            {"state": "success", "runs": [first]},
-            {"state": "success", "runs": [retried]},
-            {"state": "success", "runs": [retried]},
-            {"state": "success", "runs": [retried]},
+            watch.summarize_merge_pipeline_runs([first]),
+            watch.summarize_merge_pipeline_runs([retried]),
+            watch.summarize_merge_pipeline_runs([retried]),
+            watch.summarize_merge_pipeline_runs([retried]),
         ]
 
         out, _collector, getter = self.run_clocked(statuses)

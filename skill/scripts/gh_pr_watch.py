@@ -915,8 +915,12 @@ def summarize_merge_pipeline_runs(runs):
     """Aggregate the workflow runs for a commit into one post-merge pipeline state."""
     latest = latest_runs_by_workflow(runs)
     latest.sort(key=lambda run: (str(run.get("name") or ""), str(run.get("id") or "")))
+    # The signature covers every observed run, not just the subset a state
+    # reports, so a new run restarts the settle hold even when the state stays
+    # the same (for example, an already-finished downstream deployment run).
+    signature = merge_pipeline_run_signature(latest)
     if not latest:
-        return {"state": "missing", "runs": []}
+        return {"state": "missing", "runs": [], "signature": signature}
 
     waiting = [
         run for run in latest
@@ -928,28 +932,28 @@ def summarize_merge_pipeline_runs(runs):
         if str(run.get("status") or "") != "completed" and run not in waiting
     ]
     if pending:
-        return {"state": "pending", "runs": latest}
+        return {"state": "pending", "runs": latest, "signature": signature}
 
     failed = [
         run for run in latest
         if str(run.get("conclusion") or "") in MERGE_PIPELINE_FAILED_CONCLUSIONS
     ]
     if failed:
-        return {"state": "failed", "runs": failed}
+        return {"state": "failed", "runs": failed, "signature": signature}
 
     canceled = [
         run for run in latest
         if str(run.get("conclusion") or "") in MERGE_PIPELINE_CANCELED_CONCLUSIONS
     ]
     if canceled:
-        return {"state": "canceled", "runs": canceled}
+        return {"state": "canceled", "runs": canceled, "signature": signature}
 
     undecided = [
         run for run in latest
         if run not in waiting and not str(run.get("conclusion") or "")
     ]
     if undecided:
-        return {"state": "pending", "runs": latest}
+        return {"state": "pending", "runs": latest, "signature": signature}
 
     if waiting:
         run = waiting[0]
@@ -957,12 +961,13 @@ def summarize_merge_pipeline_runs(runs):
             "state": "manual",
             "runs": waiting,
             "job": str(run.get("name") or run.get("display_title") or "pipeline"),
+            "signature": signature,
         }
 
     if all(str(run.get("conclusion") or "") == "skipped" for run in latest):
-        return {"state": "skipped", "runs": latest}
+        return {"state": "skipped", "runs": latest, "signature": signature}
 
-    return {"state": "success", "runs": latest}
+    return {"state": "success", "runs": latest, "signature": signature}
 
 
 def get_workflow_run_jobs(repo, run_id):
@@ -1033,10 +1038,7 @@ def merge_pipeline_run_signature(runs):
 
 def merge_pipeline_settle_key(status):
     """What the settle hold compares between polls: the state and the run set."""
-    signature = status.get("signature")
-    if signature is None:
-        signature = merge_pipeline_run_signature(status.get("runs") or [])
-    return (str(status.get("state") or ""), signature)
+    return (str(status.get("state") or ""), status.get("signature") or ())
 
 
 def get_merge_pipeline_status(target):
@@ -1046,10 +1048,6 @@ def get_merge_pipeline_status(target):
     )
     runs = [run for run in runs if is_base_branch_workflow_run(run, target["base_branch"])]
     status = summarize_merge_pipeline_runs(runs)
-    # The signature covers every observed run, not just the subset the state
-    # reports, so a new run restarts the settle hold even when the state stays
-    # the same (for example, an already-finished downstream deployment run).
-    status["signature"] = merge_pipeline_run_signature(latest_runs_by_workflow(runs))
     if status["state"] == "failed" and status.get("runs"):
         status["job"] = first_failed_job_name(target["repo"], status["runs"][0])
     return status
@@ -3072,6 +3070,8 @@ def run_watch_merge_pipeline(args):
     while True:
         now = time.time()
         if now - started_at > max_session_seconds:
+            # If the hold keeps restarting, print the latest non-failed status
+            # rather than a bare timeout: the pipeline looked green on every poll.
             print_merge_pipeline_result(held[1] if held else {"state": "timeout"})
             return 0
         try:

@@ -49,7 +49,8 @@ empty, waits for the base-branch pipeline on that commit, and prints one line:
 | `timeout` | The pipeline was still pending at `--max-session-minutes` (a result already in its hold is printed instead). | Report it; do not keep polling by hand. |
 
 A closed unmerged PR skips this step. Cleanup can proceed after a merge; a post-merge failure is reported, not fixed
-automatically. On GitHub the watcher keeps every result except `failed` stable for 60 seconds before printing it, so a
+automatically. On GitHub the watcher keeps every result except `failed` stable for 60 seconds before printing it,
+restarting the hold whenever an observed run appears, retries, or changes result, so a
 late `workflow_run` chain is not missed. GitLab prints at once, as its pipeline status is already final.
 
 ## Diagnostic playbooks for uncommon actions
