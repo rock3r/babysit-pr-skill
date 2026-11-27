@@ -88,8 +88,8 @@ Diagnose a failure with `glab ci view` or `glab ci trace <job id> -R <group>/<pr
 
 After a merged MR, `--watch-merge-pipeline` resolves the commit that the target branch was updated to, in this order:
 `merge_commit_sha`, `squash_commit_sha`, then the MR `sha`, the last only when the project's `merge_method` is `ff`
-(`GET projects/<id>`). Otherwise it re-reads the MR until a merge SHA appears. It finds the newest pipeline for that commit on the target
-branch:
+and the MR is not a squash merge (`GET projects/<id>`). Otherwise it re-reads the MR until a merge SHA appears. It
+tracks every matching pipeline for that commit on the target branch:
 
 ```bash
 glab api --hostname <host> 'projects/<pipeline project id>/pipelines?sha=<sha>&ref=<target branch>'
@@ -98,11 +98,12 @@ glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/bridge
 ```
 
 If an instance ignores `ref` when `sha` is present, the watcher retries with the SHA only and keeps only pipelines whose
-`ref` equals the target branch. It picks the highest pipeline ID.
+`ref` equals the target branch. The printed state comes from the highest pipeline ID, while the 60-second hold covers
+every matching pipeline, so a second pipeline that starts later restarts it.
 
 | Pipeline status | Printed line | Notes |
 |---|---|---|
-| `success` | `success` | Printed at once; no GitHub-style hold. |
+| `success` | `success` | Held for 60 s like GitHub; a late second pipeline restarts the hold. |
 | `failed` | `failed: <job>` | First failed blocking job or bridge (`allow_failure: false`); the pipeline name when the lookup fails. |
 | `canceled` | `canceled` | |
 | `skipped` | `skipped` | Not a failure. |

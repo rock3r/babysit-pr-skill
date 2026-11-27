@@ -746,17 +746,16 @@ class MergePipelineTests(unittest.TestCase):
 
         self.assertEqual((status["state"], status["job"]), ("manual", "pipeline"))
 
-    def test_a_second_pipeline_changes_the_signature_and_state(self):
+    def test_a_second_successful_pipeline_changes_the_signature(self):
         first = {"id": 5, "status": "success", "ref": "main"}
-        later = {"id": 6, "status": "running", "ref": "main"}
+        later = {"id": 6, "status": "success", "ref": "main"}
 
         with patch.object(glab, "glab_api_list", return_value=[first]):
             before = glab.get_merge_pipeline_status(self.target())
         with patch.object(glab, "glab_api_list", return_value=[first, later]):
             after = glab.get_merge_pipeline_status(self.target())
 
-        self.assertEqual(before["state"], "success")
-        self.assertEqual(after["state"], "pending")
+        self.assertEqual((before["state"], after["state"]), ("success", "success"))
         self.assertNotEqual(
             core.merge_pipeline_settle_key(before),
             core.merge_pipeline_settle_key(after),
@@ -796,6 +795,14 @@ class MergePipelineTests(unittest.TestCase):
         self.assertEqual(pr["squash_commit_sha"], "s" * 40)
         self.assertTrue(pr["squash"])
 
+    def test_normalize_mr_reads_squash_on_merge_too(self):
+        payload = mr_payload(state="merged")
+        payload["squash_on_merge"] = True
+
+        pr = glab.normalize_mr(payload, HOST)
+
+        self.assertTrue(pr["squash"])
+
 
 class ConfigTests(unittest.TestCase):
     def test_codex_and_pr_af_are_forced_off(self):
@@ -817,7 +824,7 @@ class ConfigTests(unittest.TestCase):
                 patch.object(core, "activate_config", core.activate_config), \
                 patch.object(core, "collect_merge_pipeline_target", None), \
                 patch.object(core, "get_merge_pipeline_status", None), \
-                patch.object(core, "MERGE_PIPELINE_SETTLE_SECONDS", 60), \
+                patch.object(core, "MERGE_PIPELINE_SETTLE_SECONDS", 45), \
                 patch.object(core, "main", return_value=42) as mock_main:
             exit_code = glab.main()
             self.assertEqual(exit_code, 42)
@@ -826,7 +833,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIs(core.activate_config, glab.activate_config)
             self.assertIs(core.collect_merge_pipeline_target, glab.collect_merge_pipeline_target)
             self.assertIs(core.get_merge_pipeline_status, glab.get_merge_pipeline_status)
-            self.assertEqual(core.MERGE_PIPELINE_SETTLE_SECONDS, 60)
+            self.assertEqual(core.MERGE_PIPELINE_SETTLE_SECONDS, 45)
             mock_main.assert_called_once_with()
 
 

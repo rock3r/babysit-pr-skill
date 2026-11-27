@@ -454,11 +454,6 @@ def find_merge_pipelines(host, project_id, merge_sha, base_branch):
     ]
 
 
-def find_merge_pipeline(host, project_id, merge_sha, base_branch):
-    """The newest base-branch pipeline for the merge commit, or None."""
-    return newest_pipeline(find_merge_pipelines(host, project_id, merge_sha, base_branch))
-
-
 def merge_pipeline_signature(pipelines):
     """Identity of every observed pipeline, so a late pipeline restarts the hold."""
     return tuple(sorted(

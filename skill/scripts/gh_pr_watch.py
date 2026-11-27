@@ -920,6 +920,14 @@ def collect_merge_pipeline_target(args):
     return merge_pipeline_target_from_pr(pr, [pr.get("merge_commit_sha")])
 
 
+def _run_attempt_number(run):
+    """The run attempt as an int, tolerating a string from an unexpected payload."""
+    try:
+        return int(run.get("run_attempt") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def merge_pipeline_runs(runs):
     """Every observed post-merge run, one entry per run id.
 
@@ -938,7 +946,7 @@ def merge_pipeline_runs(runs):
             anonymous.append(run)
             continue
         prev = selected.get(run_id)
-        if prev is None or (run.get("run_attempt") or 0) >= (prev.get("run_attempt") or 0):
+        if prev is None or _run_attempt_number(run) >= _run_attempt_number(prev):
             selected[run_id] = run
     return list(selected.values()) + anonymous
 
@@ -1068,7 +1076,7 @@ def merge_pipeline_run_signature(runs):
     return tuple(sorted(
         (
             str(run.get("id") or ""),
-            str(run.get("run_attempt") or ""),
+            str(_run_attempt_number(run)),
             str(run.get("status") or ""),
             str(run.get("conclusion") or ""),
         )
@@ -3135,8 +3143,10 @@ def run_watch_merge_pipeline(args):
         except (GhCommandError, RuntimeError) as err:
             sys.stderr.write(f"gh_pr_watch.py merge pipeline poll error (retrying): {err}\n")
             # The last good poll is no longer a settled observation: an outage can
-            # hide a late failing run, so the settle window must start again.
+            # hide a late failing run or consume the discovery window, so both
+            # timers must start again.
             held = None
+            no_pipeline_since = None
             time.sleep(args.poll_seconds)
             continue
 

@@ -52,7 +52,8 @@ gh api repos/{owner}/{repo}/actions/runs/<run-id>/jobs -X GET -f per_page=100 -f
 `action_required` reports `manual: <workflow>`. A failed run reports its first failed job, or the workflow name when the
 jobs lookup fails. Every result except `failed` is held for 60 seconds to catch a late `workflow_run`, and the hold
 restarts whenever an observed run appears, retries, or changes result; no run within 5 minutes reports `no_pipeline`.
-Independent runs of one workflow all count, and a `neutral` conclusion is a pass. A poll error clears the hold, and a
+Independent runs of one workflow all count, so a failed or canceled run is not hidden by a newer successful
+invocation; a rerun replaces its earlier attempt. A `neutral` conclusion is a pass. A poll error clears the hold, and a
 job name is flattened to one line before printing. An empty `mergeCommit.oid` is re-read on each poll until it appears.
 
 ### Failed log inspection

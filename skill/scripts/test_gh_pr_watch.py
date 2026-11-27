@@ -3333,6 +3333,24 @@ class MergePipelineRunTests(unittest.TestCase):
 
         self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
 
+    def test_a_string_attempt_is_compared_as_a_number(self):
+        runs = [
+            self.merge_run(1, "CI", "completed", "failure", run_attempt="1"),
+            self.merge_run(1, "CI", "completed", "success", run_attempt="2"),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
+
+    def test_a_canceled_independent_run_still_counts(self):
+        # Worst outcome wins across independent runs. A canceled push run is not
+        # hidden by a later successful dispatch; this is the intended trade-off.
+        runs = [
+            self.merge_run(1, "CI", "completed", "cancelled", workflow_id=10),
+            self.merge_run(2, "CI", "completed", "success", workflow_id=10),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "canceled")
+
     def test_an_unknown_conclusion_waits_instead_of_reporting_success(self):
         status = watch.summarize_merge_pipeline_runs(
             [self.merge_run(1, "CI", "completed", "mystery")]
@@ -3380,7 +3398,7 @@ class MergePipelineStatusTests(unittest.TestCase):
         # An empty head_branch cannot be proven to be the base branch. A failed
         # run from an unknown ref must not turn the post-merge result red.
         runs = [
-            self.merge_run(1, "CI", "completed", "failure", head_branch=""),
+            self.merge_run(1, "Deploy", "completed", "failure", head_branch=""),
             self.merge_run(2, "CI", "completed", "success"),
         ]
 
@@ -3398,6 +3416,15 @@ class MergePipelineStatusTests(unittest.TestCase):
                 signatures.append(watch.get_merge_pipeline_status(self.target())["signature"])
 
         self.assertEqual(len(set(signatures)), 3)
+
+    def test_the_signature_normalizes_a_string_attempt(self):
+        run = dict(self.merge_run(1, "CI", "completed", "success"), run_attempt=2)
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[run]):
+            numeric = watch.get_merge_pipeline_status(self.target())["signature"]
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[dict(run, run_attempt="2")]):
+            textual = watch.get_merge_pipeline_status(self.target())["signature"]
+
+        self.assertEqual(numeric, textual)
 
     def test_the_signature_covers_runs_the_state_filters_out(self):
         canceled = self.merge_run(1, "CI", "completed", "cancelled")
@@ -3579,6 +3606,25 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         out, _collector, _getter = self.run_clocked(statuses, max_session_minutes=1)
 
         self.assertEqual(out, "timeout\n")
+
+    def test_a_poll_error_restarts_the_no_pipeline_grace(self):
+        # Missing for 2 minutes, blind for 2 minutes, then missing again. The
+        # outage must not make the five-minute discovery window look satisfied.
+        statuses = [
+            {"state": "missing"},
+            watch.GhCommandError("boom"),
+            {"state": "missing"},
+            {"state": "missing"},
+            {"state": "missing"},
+            {"state": "missing"},
+        ]
+
+        out, _collector, getter = self.run_clocked(
+            statuses, poll_seconds=120, max_session_minutes=15
+        )
+
+        self.assertEqual(out, "no_pipeline\n")
+        self.assertEqual(getter.call_count, 6)
 
     def test_an_empty_merge_sha_is_re_resolved(self):
         empty = dict(self.target(), merge_sha="")
