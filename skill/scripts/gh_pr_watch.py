@@ -260,6 +260,8 @@ CHECKS_TERMINAL_GRACE_PERIOD_SECONDS = 60
 # appear. Without a bounded wait, a repository with no base-branch workflow would
 # block the watch subagent until the session timeout.
 MERGE_PIPELINE_DISCOVERY_GRACE_SECONDS = 5 * 60
+# How long past its wait timer a deployment may take to start before it counts as manual.
+DEPLOYMENT_TIMER_GRACE_SECONDS = 2 * 60
 
 # A downstream workflow_run can start just after the push workflows finish.
 # Keep a non-failed terminal result stable for this long before reporting it, so
@@ -910,11 +912,11 @@ def is_base_branch_workflow_run(run, base_branch):
 def merge_pipeline_target_from_pr(pr, sha_candidates):
     """Validate a merged PR and build the target for --watch-merge-pipeline."""
     if not pr.get("merged"):
-        raise ValueError("the pull request is not merged; --watch-merge-pipeline only runs after a merge")
+        raise ValueError("the PR/MR is not merged; --watch-merge-pipeline only runs after a merge")
     repo = str(pr.get("repo") or "")
     base_branch = str(pr.get("base_branch") or "")
     if not repo or not base_branch:
-        raise ValueError("unable to determine the repository or base branch for the merged pull request")
+        raise ValueError("unable to determine the repository or base branch for the merged PR/MR")
     for candidate in sha_candidates:
         sha = str(candidate or "").strip()
         if sha:
@@ -973,16 +975,24 @@ def waiting_run_needs_manual_approval(repo, run):
     own, so it keeps the watcher polling instead of reporting `manual` and exiting
     before the deployment runs. Required reviewers, a custom protection rule (no
     reviewers and no timer), or a timer that has already elapsed need someone, so
-    they are manual. A failed lookup
-    raises so the watch loop retries; an empty pending list is not a deployment
-    approval, so it stays manual and preserves the previous behavior.
+    they are manual. A transient lookup error raises so the watch loop retries; a
+    lasting one is manual. An empty pending list is not a deployment approval, so
+    it stays manual and preserves the previous behavior.
     """
     run_id = run.get("id")
     if not run_id:
         return True
-    pending = gh_json(
-        ["api", f"repos/{repo}/actions/runs/{run_id}/pending_deployments", "-X", "GET"]
-    )
+    try:
+        pending = gh_json(
+            ["api", f"repos/{repo}/actions/runs/{run_id}/pending_deployments", "-X", "GET"],
+            repo=repo,
+        )
+    except GhCommandError as err:
+        if is_transient_error(err):
+            raise
+        # A lasting failure (a token that cannot read deployments, say) would
+        # otherwise poll until the session ends; a person can look instead.
+        return True
     if not isinstance(pending, list) or not pending:
         return True
     if not all(isinstance(deployment, dict) for deployment in pending):
@@ -1002,7 +1012,11 @@ def deployment_waits_on_timer_only(deployment, now):
     if minutes <= 0:
         return False
     started = parse_github_time_seconds(deployment.get("wait_timer_started_at"))
-    return started is None or now < started + minutes * 60
+    if started is None:
+        # No start time to count from, so it cannot be shown to clear by itself.
+        return False
+    # GitHub starts the deployment a little after the timer ends; give it that time.
+    return now < started + minutes * 60 + DEPLOYMENT_TIMER_GRACE_SECONDS
 
 
 def summarize_merge_pipeline_runs(runs, waiting_needs_manual=None):
@@ -3206,11 +3220,22 @@ def with_session_timeout_action(snapshot):
 # Errors worth retrying on the first PR/MR lookup: a server, network, or rate-limit
 # hiccup. Anything else there (a missing PR, a mistyped repo, bad auth, no CLI)
 # cannot fix itself, so it fails at once instead of waiting out the session.
+# Every phrase holds a space, so a repo, group or branch name (which cannot) never matches.
 TRANSIENT_ERROR_PATTERN = re.compile(
-    r"HTTP 5\d\d|HTTP 429|rate limit|timed out|timeout|connection (reset|refused)|unexpected EOF"
-    r"|no such host|temporary failure|network is unreachable",
+    r"HTTP 5\d\d|HTTP 429|rate limit|timed out|i/o timeout|handshake timeout|connection (reset|refused)"
+    r"|unexpected EOF|no such host|temporary failure|network is unreachable",
     re.IGNORECASE,
 )
+
+
+def is_transient_error(err):
+    """Whether a CLI error looks like a server, network, or rate-limit hiccup."""
+    first, _, rest = str(err).partition("\n")
+    if re.match(r"(GitHub|GitLab) CLI command timed out:", first):
+        return True
+    # Skip the command line: its arguments can hold any repo or branch name.
+    text = rest if re.match(r"(GitHub|GitLab) CLI command failed:", first) else str(err)
+    return bool(TRANSIENT_ERROR_PATTERN.search(text))
 
 
 def run_watch_merge_pipeline(args):
@@ -3236,7 +3261,7 @@ def run_watch_merge_pipeline(args):
                 target = collect_merge_pipeline_target(args)
             status = get_merge_pipeline_status(target) if target["merge_sha"] else {"state": "missing"}
         except (GhCommandError, RuntimeError) as err:
-            if target is None and not TRANSIENT_ERROR_PATTERN.search(str(err)):
+            if target is None and not is_transient_error(err):
                 raise
             sys.stderr.write(f"gh_pr_watch.py merge pipeline poll error (retrying): {err}\n")
             # The last good poll is no longer a settled observation: an outage can
@@ -3252,6 +3277,9 @@ def run_watch_merge_pipeline(args):
             held = None
             if state == "pending":
                 no_pipeline_since = None
+            elif not target["merge_sha"]:
+                # The discovery window starts once there is a commit to look for.
+                pass
             elif no_pipeline_since is None:
                 no_pipeline_since = now
             elif now - no_pipeline_since >= MERGE_PIPELINE_DISCOVERY_GRACE_SECONDS:

@@ -15,6 +15,10 @@ if SCRIPT_DIR not in sys.path:
 import gh_pr_watch as watch
 
 
+def utc_now_iso():
+    return watch.datetime.now(watch.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def configured(overrides=None):
     """Patch the watcher's active config with `overrides` merged over the defaults."""
     config, _warnings = watch.build_config(overrides or {})
@@ -3490,13 +3494,15 @@ class MergePipelineStatusTests(unittest.TestCase):
 
         with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
                 patch.object(watch, "gh_json", return_value=[
-                    {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": []}
+                    {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": [],
+                     "wait_timer_started_at": utc_now_iso()}
                 ]) as api:
             status = watch.get_merge_pipeline_status(self.target())
 
         self.assertEqual(status["state"], "pending")
         api.assert_called_once_with(
-            ["api", "repos/owner/repo/actions/runs/1/pending_deployments", "-X", "GET"]
+            ["api", "repos/owner/repo/actions/runs/1/pending_deployments", "-X", "GET"],
+            repo="owner/repo",
         )
 
     def test_a_reviewer_gated_deployment_wait_is_manual(self):
@@ -3516,12 +3522,21 @@ class MergePipelineStatusTests(unittest.TestCase):
         with patch.object(watch, "gh_json", return_value=[]):
             self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
 
-    def test_an_unreadable_pending_deployment_raises_for_a_retry(self):
+    def test_a_transient_pending_deployment_error_raises_for_a_retry(self):
         run = self.merge_run(1, "Deploy", "waiting")
+        error = watch.GhCommandError("GitHub CLI command failed: gh api x\nstderr: HTTP 502: Bad Gateway")
 
-        with patch.object(watch, "gh_json", side_effect=watch.GhCommandError("boom")):
+        with patch.object(watch, "gh_json", side_effect=error):
             with self.assertRaises(watch.GhCommandError):
                 watch.waiting_run_needs_manual_approval("owner/repo", run)
+
+    def test_a_lasting_pending_deployment_error_is_manual(self):
+        # A token that cannot read deployments must not poll until the session ends.
+        run = self.merge_run(1, "Deploy", "waiting")
+        error = watch.GhCommandError("GitHub CLI command failed: gh api x\nstderr: HTTP 403: Forbidden")
+
+        with patch.object(watch, "gh_json", side_effect=error):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
 
     def test_a_malformed_pending_deployment_payload_raises(self):
         run = self.merge_run(1, "Deploy", "waiting")
@@ -3548,7 +3563,8 @@ class MergePipelineStatusTests(unittest.TestCase):
         deployment = {"wait_timer": 5, "wait_timer_started_at": "2026-01-01T00:00:00Z", "reviewers": []}
         started = watch.parse_github_time_seconds(deployment["wait_timer_started_at"])
 
-        for now, manual in ((started + 4 * 60, False), (started + 6 * 60, True)):
+        # Pending through the 5-minute timer and its grace, then manual.
+        for now, manual in ((started + 4 * 60, False), (started + 6 * 60, False), (started + 8 * 60, True)):
             with patch.object(watch, "gh_json", return_value=[deployment]), \
                     patch.object(watch.time, "time", return_value=now):
                 self.assertEqual(watch.waiting_run_needs_manual_approval("owner/repo", run), manual)
@@ -3565,8 +3581,16 @@ class MergePipelineStatusTests(unittest.TestCase):
         run = self.merge_run(1, "Deploy", "waiting")
 
         with patch.object(watch, "gh_json", return_value=[
-                {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": []}]):
+                {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": [],
+                 "wait_timer_started_at": utc_now_iso()}]):
             self.assertFalse(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_a_wait_timer_without_a_start_time_is_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": []}]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
 
     def test_the_signature_changes_when_a_finished_run_appears_or_retries(self):
         first = self.merge_run(1, "CI", "completed", "success")
@@ -3832,6 +3856,16 @@ class RunWatchMergePipelineTests(unittest.TestCase):
         self.assertEqual(out, "no_pipeline\n")
         self.assertEqual(getter.call_count, 6)
 
+    def test_the_discovery_window_starts_once_the_merge_sha_is_known(self):
+        # The merge SHA appears after 4.5 minutes; the 5-minute window starts then.
+        empty = dict(self.target(), merge_sha="")
+        targets = [empty] * 9 + [self.target()]
+
+        out, _collector, getter = self.run_clocked([{"state": "missing"}] * 20, targets=targets)
+
+        self.assertEqual(out, "no_pipeline\n")
+        self.assertEqual(getter.call_count, 11)
+
     def test_an_empty_merge_sha_is_re_resolved(self):
         empty = dict(self.target(), merge_sha="")
         statuses = [{"state": "failed", "job": "build"}]
@@ -3863,7 +3897,16 @@ class RunWatchMergePipelineTests(unittest.TestCase):
             watch.GhCommandError("GraphQL: Could not resolve to a Repository with the name 'owner/typo'."),
             watch.GhCommandError("HTTP 401: Bad credentials"),
             watch.GhCommandError("`gh` command not found"),
-            ValueError("the pull request is not merged"),
+            # Words from the command line, such as a repo name, are not a network error.
+            watch.GhCommandError(
+                "GitHub CLI command failed: gh pr view 99999 -R acme/request-timeout-lib --json number\n"
+                "stderr: GraphQL: Could not resolve to a PullRequest with the number of 99999."
+            ),
+            watch.GhCommandError(
+                "GitHub CLI command failed: gh pr view 1 -R acme/timeout-rate-limit\n"
+                "stderr: GraphQL: Could not resolve to a Repository with the name 'acme/timeout-rate-limit'."
+            ),
+            ValueError("the PR/MR is not merged"),
         ]
         for error in errors:
             with patch.object(watch, "collect_merge_pipeline_target", side_effect=[error]) as collector, \

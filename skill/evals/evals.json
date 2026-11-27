@@ -170,7 +170,7 @@
       "assertions": [
         "Runs `--watch-merge-pipeline` in the same watch subagent after a merged `stop_pr_closed`; a closed unmerged PR skips it",
         "Uses the base-branch merge commit (GitHub `mergeCommit.oid`), not the PR head SHA, and appends the bare result such as `merge_pipeline: success` to the action line",
-        "On `failed: <job>`, reports the job and pipeline URL to the owner and does not push to the base branch or rerun base-branch jobs unless the owner asks",
+        "On `failed: <job>`, reports the job and the merge commit to the owner and does not push to the base branch or rerun base-branch jobs unless the owner asks",
         "Treats a GitHub `neutral` conclusion as not green (`failed: <job>`, since a check has findings) and never as `success`",
         "Treats `canceled`, `manual: <job>`, `skipped`, `no_pipeline`, and `timeout` as report-only outcomes, not as failures to fix automatically",
         "May proceed with normal post-merge cleanup after a successful pipeline"

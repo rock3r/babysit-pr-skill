@@ -94,11 +94,10 @@ wrong commit. Otherwise it re-reads the MR until a merge SHA appears. It
 tracks every matching pipeline for that commit on the target branch:
 
 ```bash
-glab api --hostname <host> 'projects/<pipeline project id>/pipelines?sha=<sha>&ref=<target branch>'
-glab api --hostname <host> 'projects/<pipeline project id>/pipelines?sha=<sha>&ref=<target branch>&source=parent_pipeline'
-glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/bridges?per_page=100&page=<n>'
-glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/jobs?per_page=100&page=<n>'
-glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/bridges?per_page=100&page=<n>'
+glab api --hostname <host> 'projects/<target project id>/pipelines?sha=<sha>&ref=<target branch>'
+glab api --hostname <host> 'projects/<target project id>/pipelines?sha=<sha>&ref=<target branch>&source=parent_pipeline'
+glab api --hostname <host> 'projects/<target project id>/pipelines/<id>/jobs?per_page=100&page=<n>'
+glab api --hostname <host> 'projects/<target project id>/pipelines/<id>/bridges?per_page=100&page=<n>'
 ```
 
 If an instance ignores `ref` when `sha` is present, the watcher retries with the SHA only and keeps only pipelines whose

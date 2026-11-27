@@ -21,10 +21,12 @@ This is a minor release: it adds a post-merge pipeline mode and the subagent wat
   allows failure), so an older failure is never hidden by a newer success. On GitHub only runs from events the merge
   starts count (`push`, `workflow_run`, `workflow_dispatch`, `dynamic`, `check_suite`, `deployment`,
   `deployment_status`), so an `issue_comment` or `schedule` run on the merge commit cannot decide the result. A waiting
-  deployment is pending only while every gate is a wait timer that has not elapsed; a custom protection rule reports
-  `manual`. A job name is flattened to one line before it is printed. A failed post-merge pipeline is
+  deployment is pending only while every gate is a wait timer that has not elapsed (with a 2-minute grace); a custom
+  protection rule, a timer with no start time, or a pending-deployments lookup that fails for good reports `manual`.
+  The 5-minute `no_pipeline` window starts once the merge commit is known. A job name is flattened to one line before it is printed. A failed post-merge pipeline is
   report-only: the watcher never pushes to the base branch or reruns base-branch jobs. A transient error (HTTP 5xx or
-  429, a timeout, a dropped connection) on the first PR/MR lookup is retried like a later poll; any other error there,
+  429, a timeout, a dropped connection, read from the error output, not the command line) on the first PR/MR lookup is
+  retried like a later poll; any other error there,
   such as a missing PR/MR, a mistyped repo, or bad auth, fails at once, as does an unmerged PR/MR.
 - `SKILL.md`: run every blocking wait in a subagent at the lowest model tier and lowest reasoning effort; the subagent
   returns one action line plus only the identifiers the main agent needs, then the main agent acts and starts a new
