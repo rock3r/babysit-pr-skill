@@ -182,6 +182,11 @@ def normalize_mr(mr, host):
         "head_sha": str(mr.get("sha") or ""),
         "head_branch": str(mr.get("source_branch") or ""),
         "base_branch": str(mr.get("target_branch") or ""),
+        "merge_commit_sha": str(mr.get("merge_commit_sha") or ""),
+        "squash_commit_sha": str(mr.get("squash_commit_sha") or ""),
+        # A squash merge creates a new commit, so the MR head is not on the target
+        # branch even when the project only allows fast-forward merges.
+        "squash": bool(mr.get("squash") or mr.get("squash_on_merge")),
         "state": MR_STATE_MAP.get(raw_state, raw_state.upper()),
         "merged": raw_state == "merged",
         "closed": raw_state not in ("opened", "locked"),
@@ -360,6 +365,248 @@ def get_mr_checks(pr, mr):
 def retry_job(pr, run_id):
     """Replacement for core.rerun_failed_run: retry one failed GitLab job."""
     glab_api(pr["host"], f"projects/{project_ref(pr['pipeline_project_id'])}/jobs/{run_id}/retry", method="POST")
+
+
+# --- Post-merge pipeline ------------------------------------------------------------
+
+
+def collect_merge_pipeline_target(args):
+    """Resolve the MR and the base-branch commit to watch after a merge."""
+    pr, _mr = resolve_mr(args.pr, repo_override=args.repo)
+    candidates = [pr.get("merge_commit_sha")]
+    # Only a fast-forward merge puts another field on the target branch: a
+    # squashed MR advances it to `squash_commit_sha`, a non-squashed one to the
+    # MR head. With `merge` or `rebase_merge`, `squash_commit_sha` is a commit on
+    # the source branch and the target gets its own commit, so that field can
+    # lag or name the wrong commit. Wait for `merge_commit_sha` instead.
+    if pr.get("merged") and not any(candidates) and project_merge_method(pr) == "ff":
+        candidates.append(pr.get("squash_commit_sha"))
+        if not pr.get("squash"):
+            candidates.append(pr.get("head_sha"))
+    return core.merge_pipeline_target_from_pr(pr, candidates)
+
+
+def project_merge_method(pr):
+    project = glab_api(pr["host"], f"projects/{project_ref(pr.get('project_id') or pr['repo'])}")
+    return str(project.get("merge_method") or "") if isinstance(project, dict) else ""
+
+
+def newest_pipeline(pipelines):
+    candidates = [
+        pipeline for pipeline in pipelines or []
+        if isinstance(pipeline, dict) and pipeline.get("id") is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pipeline: pipeline.get("id") or 0)
+
+
+# Post-merge pipeline statuses after which a result can be reported. Anything
+# else (created, waiting_for_resource, preparing, pending, running, scheduled)
+# is still on its way.
+MERGE_PIPELINE_TERMINAL_STATUSES = {
+    "success", "failed", "canceled", "skipped", "manual", "blocked",
+}
+MERGE_PIPELINE_FAILED_STATUSES = {"failed"}
+MERGE_PIPELINE_CANCELED_STATUSES = {"canceled"}
+MERGE_PIPELINE_MANUAL_STATUSES = {"manual", "blocked"}
+# Statuses that are green when every pipeline on the commit has one of them.
+MERGE_PIPELINE_GREEN_STATUSES = {"success", "skipped"}
+
+
+def pipelines_with_statuses(pipelines, statuses):
+    return [
+        pipeline for pipeline in pipelines or []
+        if isinstance(pipeline, dict)
+        and pipeline.get("id") is not None
+        and str(pipeline.get("status") or "") in statuses
+    ]
+
+
+def pipeline_jobs(host, project_id, pipeline_id):
+    """Jobs and bridge jobs of one pipeline, as one list."""
+    base = f"projects/{project_ref(project_id)}/pipelines/{pipeline_id}"
+    jobs = glab_api_list(host, f"{base}/jobs")
+    jobs += glab_api_list(host, f"{base}/bridges")
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def first_pipeline_job_name(jobs, statuses, require_blocking=False):
+    matching = [
+        job for job in jobs
+        if str(job.get("status") or "") in statuses
+        and (not require_blocking or not job.get("allow_failure"))
+    ]
+    if not matching:
+        return "pipeline"
+    matching.sort(key=lambda job: (job.get("id") or 0, str(job.get("name") or "")))
+    return str(matching[0].get("name") or "") or "pipeline"
+
+
+def pipeline_job_name_for(host, project_id, pipeline_id, statuses, require_blocking=False):
+    """A named job when the jobs lookup works, else the generic pipeline name."""
+    try:
+        jobs = pipeline_jobs(host, project_id, pipeline_id)
+    except core.GhCommandError:
+        return "pipeline"
+    return first_pipeline_job_name(jobs, statuses, require_blocking=require_blocking)
+
+
+def find_merge_pipelines(host, project_id, merge_sha, base_branch):
+    """Every base-branch pipeline for the merge commit, child pipelines included.
+
+    The list endpoint leaves child pipelines out unless `source=parent_pipeline`
+    asks for them. A child triggered without `strategy: depend` can still run or
+    fail after its parent succeeds, so it counts like any other pipeline, unless
+    its trigger job allows it to fail.
+    """
+    # ponytail: multi-project downstream pipelines live in other projects and are not followed.
+    use_ref = True
+    parents = _list_base_branch_pipelines(host, project_id, merge_sha, base_branch, use_ref)
+    if not parents:
+        # Some instances ignore `ref` when `sha` is present. Filter the SHA-only
+        # answer ourselves rather than watching a pipeline from another ref.
+        use_ref = False
+        parents = _list_base_branch_pipelines(host, project_id, merge_sha, base_branch, use_ref)
+    if not parents:
+        # A child pipeline needs a parent, so there is nothing more to find.
+        return []
+
+    # Ask for children the way the parent query worked, so each poll adds one call.
+    children = _list_base_branch_pipelines(
+        host, project_id, merge_sha, base_branch, use_ref, source="parent_pipeline"
+    )
+    pipelines = {}
+    for pipeline in parents + children:
+        pipelines.setdefault(pipeline.get("id"), pipeline)
+    # An instance that ignores `source` returns the parents again: no children then.
+    if len(pipelines) > len({pipeline.get("id") for pipeline in parents}):
+        optional = optional_child_pipeline_ids(host, project_id, list(pipelines.values()))
+        pipelines = {pid: pipeline for pid, pipeline in pipelines.items() if pid not in optional}
+    return list(pipelines.values())
+
+
+def _list_base_branch_pipelines(host, project_id, merge_sha, base_branch, use_ref, source=None):
+    params = f"sha={quote(merge_sha, safe='')}"
+    if use_ref:
+        params += f"&ref={quote(base_branch, safe='')}"
+    if source:
+        params += f"&source={quote(source, safe='')}"
+    return [
+        item for item in glab_api_list(host, f"projects/{project_ref(project_id)}/pipelines?{params}")
+        if isinstance(item, dict)
+        and item.get("id") is not None
+        and str(item.get("ref") or "") == base_branch
+    ]
+
+
+def optional_child_pipeline_ids(host, project_id, pipelines):
+    """Child pipelines GitLab lets fail: their trigger job, or an ancestor's, has `allow_failure`.
+
+    A lookup error raises, so the watch loop retries instead of guessing.
+    """
+    parent_of = {}
+    for pipeline in pipelines:
+        bridges = glab_api_list(
+            host, f"projects/{project_ref(project_id)}/pipelines/{pipeline['id']}/bridges"
+        )
+        for bridge in bridges:
+            downstream = bridge.get("downstream_pipeline") if isinstance(bridge, dict) else None
+            if isinstance(downstream, dict) and downstream.get("id") is not None:
+                parent_of[downstream["id"]] = (pipeline["id"], bool(bridge.get("allow_failure")))
+
+    optional = set()
+    for child_id in parent_of:
+        current, seen = child_id, set()
+        while current in parent_of and current not in seen:
+            seen.add(current)
+            parent_id, allowed = parent_of[current]
+            if allowed:
+                optional.add(child_id)
+                break
+            current = parent_id
+    return optional
+
+
+def merge_pipeline_signature(pipelines):
+    """Identity of every observed pipeline, so a late pipeline restarts the hold."""
+    return tuple(sorted(
+        (
+            str(pipeline.get("id") or ""),
+            str(pipeline.get("status") or ""),
+        )
+        for pipeline in pipelines or []
+        if isinstance(pipeline, dict)
+    ))
+
+
+def get_merge_pipeline_status(target):
+    """One post-merge state for every base-branch pipeline on the merge commit.
+
+    A commit can have several pipelines (for example a push pipeline and a
+    later scheduled one). The worst result wins, mirroring the GitHub
+    aggregation, so an older failure is never hidden by a newer success.
+    """
+    pr = target["pr"]
+    host = pr["host"]
+    project_id = pr.get("project_id") or pr.get("pipeline_project_id")
+    if not project_id:
+        raise ValueError("unable to determine the GitLab project for the merged merge request")
+
+    pipelines = find_merge_pipelines(host, project_id, target["merge_sha"], target["base_branch"])
+    signature = merge_pipeline_signature(pipelines)
+    if not pipelines:
+        return {"state": "missing", "runs": [], "signature": signature}
+
+    pending = [
+        pipeline for pipeline in pipelines
+        if str(pipeline.get("status") or "") not in MERGE_PIPELINE_TERMINAL_STATUSES
+    ]
+    if pending:
+        return {"state": "pending", "pipeline": newest_pipeline(pending), "signature": signature}
+
+    failed = pipelines_with_statuses(pipelines, MERGE_PIPELINE_FAILED_STATUSES)
+    if failed:
+        pipeline = newest_pipeline(failed)
+        return {
+            "state": "failed",
+            "job": pipeline_job_name_for(
+                host, project_id, pipeline["id"], {"failed"}, require_blocking=True
+            ),
+            "pipeline": pipeline,
+            "signature": signature,
+        }
+
+    canceled = pipelines_with_statuses(pipelines, MERGE_PIPELINE_CANCELED_STATUSES)
+    if canceled:
+        return {"state": "canceled", "pipeline": newest_pipeline(canceled), "signature": signature}
+
+    manual = pipelines_with_statuses(pipelines, MERGE_PIPELINE_MANUAL_STATUSES)
+    if manual:
+        pipeline = newest_pipeline(manual)
+        return {
+            "state": "manual",
+            "job": pipeline_job_name_for(
+                host, project_id, pipeline["id"], {"manual"}, require_blocking=True
+            ),
+            "pipeline": pipeline,
+            "signature": signature,
+        }
+
+    if all(
+        str(pipeline.get("status") or "") in MERGE_PIPELINE_GREEN_STATUSES
+        for pipeline in pipelines
+    ):
+        state = (
+            "skipped"
+            if all(str(pipeline.get("status") or "") == "skipped" for pipeline in pipelines)
+            else "success"
+        )
+        return {"state": state, "pipeline": newest_pipeline(pipelines), "signature": signature}
+
+    # A terminal status outside the known sets is not green; keep waiting for a
+    # state this watcher understands rather than reporting success.
+    return {"state": "pending", "pipeline": newest_pipeline(pipelines), "signature": signature}
 
 
 # --- Review items -------------------------------------------------------------------
@@ -605,6 +852,8 @@ def main():
     core.collect_snapshot = collect_snapshot
     core.rerun_failed_run = retry_job
     core.activate_config = activate_config
+    core.collect_merge_pipeline_target = collect_merge_pipeline_target
+    core.get_merge_pipeline_status = get_merge_pipeline_status
     return core.main()
 
 

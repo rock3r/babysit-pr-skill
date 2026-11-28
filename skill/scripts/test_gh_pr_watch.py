@@ -15,6 +15,10 @@ if SCRIPT_DIR not in sys.path:
 import gh_pr_watch as watch
 
 
+def utc_now_iso():
+    return watch.datetime.now(watch.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def configured(overrides=None):
     """Patch the watcher's active config with `overrides` merged over the defaults."""
     config, _warnings = watch.build_config(overrides or {})
@@ -3180,6 +3184,831 @@ class ReviewThreadLookupTests(unittest.TestCase):
 
         self.assertEqual(new_items, [])
         self.assertEqual(blocking_items, [])
+
+
+class MergeCommitTests(unittest.TestCase):
+    def test_resolve_pr_reads_the_merge_commit(self):
+        payload = {
+            "number": 21,
+            "url": "https://github.com/owner/repo/pull/21",
+            "state": "MERGED",
+            "mergedAt": "2026-01-01T00:00:00Z",
+            "closedAt": "2026-01-01T00:00:00Z",
+            "mergeCommit": {"oid": "m" * 40},
+            "headRefName": "feature",
+            "headRefOid": "h" * 40,
+            "headRepository": {"name": "repo", "owner": {"login": "owner"}},
+            "baseRefName": "main",
+            "mergeable": "UNKNOWN",
+            "mergeStateStatus": "UNKNOWN",
+            "reviewDecision": "",
+            "labels": [],
+        }
+
+        with patch.object(watch, "gh_json", return_value=payload):
+            pr = watch.resolve_pr("21")
+
+        self.assertEqual(pr["merge_commit_sha"], "m" * 40)
+
+
+class MergePipelineTargetTests(unittest.TestCase):
+    def test_a_merged_pr_uses_the_first_non_empty_sha(self):
+        pr = {"merged": True, "repo": "owner/repo", "base_branch": "main"}
+
+        target = watch.merge_pipeline_target_from_pr(pr, ["", "m" * 40])
+
+        self.assertEqual(target["merge_sha"], "m" * 40)
+        self.assertEqual(target["repo"], "owner/repo")
+        self.assertEqual(target["base_branch"], "main")
+
+    def test_an_unmerged_pr_is_rejected(self):
+        pr = {"merged": False, "repo": "owner/repo", "base_branch": "main"}
+
+        with self.assertRaisesRegex(ValueError, "not merged"):
+            watch.merge_pipeline_target_from_pr(pr, ["m" * 40])
+
+    def test_a_merged_pr_without_a_sha_leaves_it_empty_for_a_retry(self):
+        pr = {"merged": True, "repo": "owner/repo", "base_branch": "main"}
+
+        target = watch.merge_pipeline_target_from_pr(pr, ["", None])
+
+        self.assertEqual(target["merge_sha"], "")
+
+
+class MergePipelineRunTests(unittest.TestCase):
+    @staticmethod
+    def merge_run(run_id, name, status, conclusion="", workflow_id=None, event="push", head_branch="main",
+                  run_attempt=1):
+        return {
+            "id": run_id,
+            "run_attempt": run_attempt,
+            "name": name,
+            "workflow_id": workflow_id or name,
+            "status": status,
+            "conclusion": conclusion,
+            "event": event,
+            "head_branch": head_branch,
+            "html_url": f"https://example.invalid/runs/{run_id}",
+        }
+
+    def test_no_runs_is_missing(self):
+        self.assertEqual(watch.summarize_merge_pipeline_runs([])["state"], "missing")
+
+    def test_a_pending_run_waits(self):
+        status = watch.summarize_merge_pipeline_runs([self.merge_run(1, "CI", "in_progress")])
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_success_and_skipped_are_success(self):
+        runs = [
+            self.merge_run(1, "Build", "completed", "success"),
+            self.merge_run(3, "Docs", "completed", "skipped"),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
+
+    def test_a_neutral_run_is_not_success(self):
+        # `neutral` usually means a check has something to report, so it must
+        # not turn the post-merge pipeline green.
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "Bugbot", "completed", "neutral")]
+        )
+
+        self.assertEqual(status["state"], "failed")
+
+    def test_a_neutral_run_fails_a_pipeline_with_a_successful_run(self):
+        runs = [
+            self.merge_run(1, "Build", "completed", "success"),
+            self.merge_run(2, "Bugbot", "completed", "neutral"),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "failed")
+
+    def test_all_skipped_runs_are_skipped(self):
+        status = watch.summarize_merge_pipeline_runs([
+            self.merge_run(1, "Docs", "completed", "skipped"),
+            self.merge_run(2, "Lint", "completed", "skipped"),
+        ])
+
+        self.assertEqual(status["state"], "skipped")
+
+    def test_a_failure_wins_over_success(self):
+        runs = [
+            self.merge_run(1, "Build", "completed", "failure"),
+            self.merge_run(2, "Lint", "completed", "success"),
+        ]
+
+        status = watch.summarize_merge_pipeline_runs(runs)
+
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(len(status["runs"]), 1)
+
+    def test_a_canceled_run_is_reported(self):
+        status = watch.summarize_merge_pipeline_runs([self.merge_run(1, "Deploy", "completed", "cancelled")])
+
+        self.assertEqual(status["state"], "canceled")
+
+    def test_a_waiting_run_needs_a_human(self):
+        status = watch.summarize_merge_pipeline_runs([self.merge_run(1, "Deploy", "waiting")])
+
+        self.assertEqual(status["state"], "manual")
+        self.assertEqual(status["job"], "Deploy")
+
+    def test_an_action_required_run_needs_a_human(self):
+        status = watch.summarize_merge_pipeline_runs([self.merge_run(1, "Deploy", "completed", "action_required")])
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "Deploy"))
+
+    def test_a_timer_only_wait_stays_pending(self):
+        # A deployment held only by an environment wait timer starts on its own;
+        # exiting as `manual` would miss the deployment and any later failure.
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "Deploy", "waiting")],
+            waiting_needs_manual=lambda run: False,
+        )
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_a_timer_only_wait_keeps_the_pipeline_pending_over_a_failure(self):
+        # Any unfinished run keeps the pipeline pending, so a timer-only
+        # deployment still wins over an already-failed run.
+        runs = [
+            self.merge_run(1, "Build", "completed", "failure"),
+            self.merge_run(2, "Deploy", "waiting"),
+        ]
+
+        status = watch.summarize_merge_pipeline_runs(
+            runs,
+            waiting_needs_manual=lambda run: False,
+        )
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_a_reviewer_gated_wait_needs_a_human(self):
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "Deploy", "waiting")],
+            waiting_needs_manual=lambda run: True,
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "Deploy"))
+
+    def test_a_failure_wins_over_a_waiting_run(self):
+        runs = [
+            self.merge_run(1, "Build", "completed", "failure"),
+            self.merge_run(2, "Deploy", "waiting"),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "failed")
+
+    def test_a_pending_run_wins_over_a_waiting_run(self):
+        runs = [
+            self.merge_run(1, "Build", "in_progress"),
+            self.merge_run(2, "Deploy", "waiting"),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "pending")
+
+    def test_independent_runs_of_a_workflow_all_count(self):
+        # A push run and a workflow_dispatch run of the same workflow are separate
+        # runs, not a rerun. The older failure must not be hidden by the newer pass.
+        runs = [
+            self.merge_run(1, "CI", "completed", "failure", workflow_id=10),
+            self.merge_run(2, "CI", "completed", "success", workflow_id=10),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "failed")
+
+    def test_a_rerun_attempt_replaces_the_earlier_attempt(self):
+        runs = [
+            self.merge_run(1, "CI", "completed", "failure", run_attempt=1),
+            self.merge_run(1, "CI", "completed", "success", run_attempt=2),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
+
+    def test_a_string_attempt_is_compared_as_a_number(self):
+        runs = [
+            self.merge_run(1, "CI", "completed", "failure", run_attempt=9),
+            self.merge_run(1, "CI", "completed", "success", run_attempt="10"),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "success")
+
+    def test_a_canceled_independent_run_still_counts(self):
+        # Worst outcome wins across independent runs. A canceled push run is not
+        # hidden by a later successful dispatch; this is the intended trade-off.
+        runs = [
+            self.merge_run(1, "CI", "completed", "cancelled", workflow_id=10),
+            self.merge_run(2, "CI", "completed", "success", workflow_id=10),
+        ]
+
+        self.assertEqual(watch.summarize_merge_pipeline_runs(runs)["state"], "canceled")
+
+    def test_an_unknown_conclusion_is_not_green(self):
+        status = watch.summarize_merge_pipeline_runs(
+            [self.merge_run(1, "CI", "completed", "mystery")]
+        )
+
+        self.assertEqual(status["state"], "failed")
+
+    def test_a_completed_run_without_a_conclusion_waits(self):
+        status = watch.summarize_merge_pipeline_runs([self.merge_run(1, "CI", "completed", "")])
+
+        self.assertEqual(status["state"], "pending")
+
+
+class MergePipelineStatusTests(unittest.TestCase):
+    @staticmethod
+    def merge_run(run_id, name, status, conclusion="", event="push", head_branch="main"):
+        return {
+            "id": run_id,
+            "name": name,
+            "workflow_id": name,
+            "status": status,
+            "conclusion": conclusion,
+            "event": event,
+            "head_branch": head_branch,
+            "html_url": f"https://example.invalid/runs/{run_id}",
+        }
+
+    def target(self):
+        return {"repo": "owner/repo", "base_branch": "main", "merge_sha": "m" * 40}
+
+    def test_runs_on_other_branches_and_pull_requests_are_ignored(self):
+        runs = [
+            self.merge_run(1, "CI", "completed", "failure", event="pull_request"),
+            self.merge_run(2, "CI", "completed", "failure", event="pull_request_target"),
+            self.merge_run(3, "CI", "completed", "failure", head_branch="release"),
+            self.merge_run(4, "CI", "completed", "success"),
+        ]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "success")
+
+    def test_runs_from_events_unrelated_to_the_merge_are_ignored(self):
+        # An issue comment or a schedule runs on the base-branch HEAD, which is
+        # the merge commit right after a merge, but says nothing about the merge.
+        runs = [
+            self.merge_run(1, "Triage", "completed", "failure", event="issue_comment"),
+            self.merge_run(2, "Nightly", "completed", "neutral", event="schedule"),
+            self.merge_run(3, "Labels", "in_progress", event="issues"),
+            self.merge_run(4, "Unknown", "completed", "failure", event=""),
+            self.merge_run(5, "CI", "completed", "success"),
+        ]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "success")
+
+    def test_runs_started_by_the_merge_all_count(self):
+        for event in ("push", "workflow_run", "workflow_dispatch", "dynamic", "deployment"):
+            runs = [
+                self.merge_run(1, "CI", "completed", "success"),
+                self.merge_run(2, "Deploy", "completed", "failure", event=event),
+            ]
+
+            with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                    patch.object(watch, "first_failed_job_name", return_value="deploy"):
+                status = watch.get_merge_pipeline_status(self.target())
+
+            self.assertEqual(status["state"], "failed", event)
+
+    def test_runs_without_a_branch_are_ignored(self):
+        # An empty head_branch cannot be proven to be the base branch. A failed
+        # run from an unknown ref must not turn the post-merge result red.
+        runs = [
+            self.merge_run(1, "Deploy", "completed", "failure", head_branch=""),
+            self.merge_run(2, "CI", "completed", "success"),
+        ]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "success")
+
+    def test_a_timer_only_deployment_wait_is_pending(self):
+        runs = [self.merge_run(1, "Deploy", "waiting")]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "gh_json", return_value=[
+                    {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": [],
+                     "wait_timer_started_at": utc_now_iso()}
+                ]) as api:
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "pending")
+        api.assert_called_once_with(
+            ["api", "repos/owner/repo/actions/runs/1/pending_deployments", "-X", "GET"],
+            repo="owner/repo",
+        )
+
+    def test_a_reviewer_gated_deployment_wait_is_manual(self):
+        runs = [self.merge_run(1, "Deploy", "waiting")]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "gh_json", return_value=[
+                    {"environment": {"name": "prod"}, "reviewers": [{"type": "User"}]}
+                ]):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "Deploy"))
+
+    def test_a_waiting_run_without_pending_deployments_stays_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_a_transient_pending_deployment_error_raises_for_a_retry(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+        error = watch.GhCommandError("GitHub CLI command failed: gh api x\nstderr: HTTP 502: Bad Gateway")
+
+        with patch.object(watch, "gh_json", side_effect=error):
+            with self.assertRaises(watch.GhCommandError):
+                watch.waiting_run_needs_manual_approval("owner/repo", run)
+
+    def test_a_lasting_pending_deployment_error_is_manual(self):
+        # A token that cannot read deployments must not poll until the session ends.
+        run = self.merge_run(1, "Deploy", "waiting")
+        error = watch.GhCommandError("GitHub CLI command failed: gh api x\nstderr: HTTP 403: Forbidden")
+
+        with patch.object(watch, "gh_json", side_effect=error):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_a_malformed_pending_deployment_payload_raises(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=["not-a-deployment"]):
+            with self.assertRaises(watch.GhCommandError):
+                watch.waiting_run_needs_manual_approval("owner/repo", run)
+
+    def test_a_waiting_run_without_an_id_stays_manual(self):
+        self.assertTrue(
+            watch.waiting_run_needs_manual_approval("owner/repo", {"status": "waiting"})
+        )
+
+    def test_a_custom_protection_rule_wait_is_manual(self):
+        # A GitHub App gate lists neither reviewers nor a timer, and never clears by itself.
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "prod"}, "wait_timer": 0, "reviewers": []}]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_a_wait_timer_that_has_elapsed_is_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+        deployment = {"wait_timer": 5, "wait_timer_started_at": "2026-01-01T00:00:00Z", "reviewers": []}
+        started = watch.parse_github_time_seconds(deployment["wait_timer_started_at"])
+
+        # Pending through the 5-minute timer and its grace, then manual.
+        for now, manual in ((started + 4 * 60, False), (started + 6 * 60, False), (started + 8 * 60, True)):
+            with patch.object(watch, "gh_json", return_value=[deployment]), \
+                    patch.object(watch.time, "time", return_value=now):
+                self.assertEqual(watch.waiting_run_needs_manual_approval("owner/repo", run), manual)
+
+    def test_a_timer_and_a_custom_gate_together_are_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "staging"}, "wait_timer": 30, "reviewers": []},
+                {"environment": {"name": "prod"}, "wait_timer": 0, "reviewers": []}]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_a_waiting_run_with_only_a_wait_timer_is_not_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": [],
+                 "wait_timer_started_at": utc_now_iso()}]):
+            self.assertFalse(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_a_wait_timer_without_a_start_time_is_manual(self):
+        run = self.merge_run(1, "Deploy", "waiting")
+
+        with patch.object(watch, "gh_json", return_value=[
+                {"environment": {"name": "prod"}, "wait_timer": 30, "reviewers": []}]):
+            self.assertTrue(watch.waiting_run_needs_manual_approval("owner/repo", run))
+
+    def test_the_signature_changes_when_a_finished_run_appears_or_retries(self):
+        first = self.merge_run(1, "CI", "completed", "success")
+        second = self.merge_run(2, "Deploy", "completed", "success")
+        signatures = []
+        for runs in ([first], [first, second], [dict(first, run_attempt=2), second]):
+            with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs):
+                signatures.append(watch.get_merge_pipeline_status(self.target())["signature"])
+
+        self.assertEqual(len(set(signatures)), 3)
+
+    def test_the_signature_normalizes_a_string_attempt(self):
+        run = dict(self.merge_run(1, "CI", "completed", "success"), run_attempt=2)
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[run]):
+            numeric = watch.get_merge_pipeline_status(self.target())["signature"]
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[dict(run, run_attempt="02")]):
+            textual = watch.get_merge_pipeline_status(self.target())["signature"]
+
+        self.assertEqual(numeric, textual)
+
+    def test_the_signature_covers_runs_the_state_filters_out(self):
+        canceled = self.merge_run(1, "CI", "completed", "cancelled")
+        later = self.merge_run(2, "Deploy", "completed", "success")
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[canceled]):
+            before = watch.get_merge_pipeline_status(self.target())
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=[canceled, later]):
+            after = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((before["state"], after["state"]), ("canceled", "canceled"))
+        self.assertNotEqual(
+            watch.merge_pipeline_settle_key(before),
+            watch.merge_pipeline_settle_key(after),
+        )
+
+    def test_a_failed_run_reports_the_failed_job(self):
+        runs = [self.merge_run(1, "CI", "completed", "failure")]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "first_failed_job_name", return_value="build"):
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["job"], "build")
+
+    def test_a_neutral_run_reports_the_non_green_job(self):
+        runs = [self.merge_run(1, "Checks", "completed", "neutral")]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "first_failed_job_name", return_value="bugbot") as job:
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "bugbot"))
+        job.assert_called_once_with("owner/repo", runs[0])
+
+    def test_an_unknown_conclusion_names_the_non_green_run(self):
+        # A successful run sorted first must not be blamed for another run's
+        # unknown conclusion.
+        runs = [
+            self.merge_run(1, "Alpha", "completed", "success"),
+            self.merge_run(2, "Beta", "completed", "mystery"),
+        ]
+
+        with patch.object(watch, "get_workflow_runs_for_sha", return_value=runs), \
+                patch.object(watch, "first_failed_job_name", return_value="Beta") as job:
+            status = watch.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "Beta"))
+        job.assert_called_once_with("owner/repo", runs[1])
+
+    def test_a_failed_job_lookup_falls_back_to_the_workflow_name(self):
+        run = self.merge_run(1, "CI", "completed", "failure")
+
+        with patch.object(watch, "get_workflow_run_jobs", side_effect=watch.GhCommandError("boom")):
+            self.assertEqual(watch.first_failed_job_name("owner/repo", run), "CI")
+
+    def test_the_first_failed_job_is_reported(self):
+        run = self.merge_run(1, "CI", "completed", "failure")
+        jobs = [
+            {"id": 2, "name": "unit-tests", "conclusion": "failure"},
+            {"id": 1, "name": "lint", "conclusion": "failure"},
+        ]
+
+        with patch.object(watch, "get_workflow_run_jobs", return_value=jobs):
+            self.assertEqual(watch.first_failed_job_name("owner/repo", run), "lint")
+
+    def test_a_neutral_job_is_named_as_the_non_green_cause(self):
+        run = self.merge_run(1, "Checks", "completed", "neutral")
+        jobs = [
+            {"id": 2, "name": "build", "conclusion": "success"},
+            {"id": 1, "name": "bugbot", "conclusion": "neutral"},
+        ]
+
+        with patch.object(watch, "get_workflow_run_jobs", return_value=jobs):
+            self.assertEqual(watch.first_failed_job_name("owner/repo", run), "bugbot")
+
+    def test_a_neutral_job_does_not_shadow_a_failed_job(self):
+        run = self.merge_run(1, "CI", "completed", "failure")
+        jobs = [
+            {"id": 1, "name": "bugbot", "conclusion": "neutral"},
+            {"id": 2, "name": "build", "conclusion": "failure"},
+        ]
+
+        with patch.object(watch, "get_workflow_run_jobs", return_value=jobs):
+            self.assertEqual(watch.first_failed_job_name("owner/repo", run), "build")
+
+
+class MergePipelineOutputTests(unittest.TestCase):
+    def test_result_lines(self):
+        cases = [
+            ({"state": "success"}, "success"),
+            ({"state": "failed", "job": "build"}, "failed: build"),
+            ({"state": "failed"}, "failed: pipeline"),
+            ({"state": "canceled"}, "canceled"),
+            ({"state": "no_pipeline"}, "no_pipeline"),
+            ({"state": "manual", "job": "deploy"}, "manual: deploy"),
+            ({"state": "skipped"}, "skipped"),
+            ({"state": "timeout"}, "timeout"),
+        ]
+
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertEqual(watch.format_merge_pipeline_result(status), expected)
+
+    def test_an_unknown_state_is_an_error(self):
+        with self.assertRaises(ValueError):
+            watch.format_merge_pipeline_result({"state": "surprise"})
+
+    def test_job_names_are_sanitized_to_one_line(self):
+        line = watch.format_merge_pipeline_result(
+            {"state": "failed", "job": "build\nfake line\x1b[31m\tand more"}
+        )
+
+        self.assertEqual(line, "failed: build fake line [31m and more")
+
+
+class RunWatchMergePipelineTests(unittest.TestCase):
+    @staticmethod
+    def args(**overrides):
+        values = {"pr": "auto", "repo": None, "poll_seconds": 30, "max_session_minutes": 90}
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def merge_run(run_id, run_attempt=1, status="completed", conclusion="success"):
+        return {
+            "id": run_id,
+            "run_attempt": run_attempt,
+            "workflow_id": run_id,
+            "name": f"workflow-{run_id}",
+            "status": status,
+            "conclusion": conclusion,
+        }
+
+    def target(self):
+        return {"repo": "owner/repo", "base_branch": "main", "merge_sha": "m" * 40}
+
+    def test_prints_success_after_the_settle_grace(self):
+        now = [0.0]
+        statuses = [{"state": "success"}] * 3
+        stdout = io.StringIO()
+
+        def fake_sleep(seconds):
+            now[0] += seconds
+
+        with patch.object(watch, "collect_merge_pipeline_target", return_value=self.target()), \
+                patch.object(watch, "get_merge_pipeline_status", side_effect=statuses), \
+                patch.object(watch.time, "time", side_effect=lambda: now[0]), \
+                patch.object(watch.time, "sleep", side_effect=fake_sleep), \
+                patch.object(sys, "stdout", stdout):
+            code = watch.run_watch_merge_pipeline(self.args())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), "success\n")
+
+    def test_prints_a_failure_with_the_job_name_immediately(self):
+        stdout = io.StringIO()
+
+        with patch.object(watch, "collect_merge_pipeline_target", return_value=self.target()), \
+                patch.object(watch, "get_merge_pipeline_status",
+                             return_value={"state": "failed", "job": "build"}), \
+                patch.object(watch.time, "sleep") as sleep, \
+                patch.object(sys, "stdout", stdout):
+            code = watch.run_watch_merge_pipeline(self.args())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), "failed: build\n")
+        sleep.assert_not_called()
+
+    def test_no_pipeline_is_reported_after_the_discovery_grace(self):
+        now = [0.0]
+        statuses = [{"state": "missing"}] * 11
+        stdout = io.StringIO()
+
+        def fake_sleep(seconds):
+            now[0] += seconds
+
+        with patch.object(watch, "collect_merge_pipeline_target", return_value=self.target()), \
+                patch.object(watch, "get_merge_pipeline_status", side_effect=statuses), \
+                patch.object(watch.time, "time", side_effect=lambda: now[0]), \
+                patch.object(watch.time, "sleep", side_effect=fake_sleep), \
+                patch.object(sys, "stdout", stdout):
+            code = watch.run_watch_merge_pipeline(self.args())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), "no_pipeline\n")
+
+    def run_clocked(self, statuses, targets=None, **arg_overrides):
+        now = [0.0]
+        stdout = io.StringIO()
+
+        def fake_sleep(seconds):
+            now[0] += seconds
+
+        collect = patch.object(watch, "collect_merge_pipeline_target",
+                               side_effect=targets or [self.target()])
+        with collect as collector, \
+                patch.object(watch, "get_merge_pipeline_status", side_effect=statuses) as getter, \
+                patch.object(watch.time, "time", side_effect=lambda: now[0]), \
+                patch.object(watch.time, "sleep", side_effect=fake_sleep), \
+                patch.object(sys, "stdout", stdout):
+            code = watch.run_watch_merge_pipeline(self.args(**arg_overrides))
+        self.assertEqual(code, 0)
+        return stdout.getvalue(), collector, getter
+
+    def test_a_green_pipeline_in_its_hold_is_success_at_the_session_limit(self):
+        # Pending until 30s before the 1-minute limit, then green: the hold outlives the session.
+        statuses = [{"state": "pending"}, {"state": "success"}] + [{"state": "success"}] * 5
+
+        out, _collector, _getter = self.run_clocked(statuses, max_session_minutes=1)
+
+        self.assertEqual(out, "success\n")
+
+    def test_a_poll_error_invalidates_the_held_result(self):
+        # Success at t=0, then the API fails until the session limit. The stale
+        # success must not be printed as if the settle window had completed.
+        statuses = [
+            {"state": "success"},
+            watch.GhCommandError("boom"),
+            watch.GhCommandError("boom"),
+            watch.GhCommandError("boom"),
+        ]
+
+        out, _collector, _getter = self.run_clocked(statuses, max_session_minutes=1)
+
+        self.assertEqual(out, "timeout\n")
+
+    def test_a_poll_error_restarts_the_no_pipeline_grace(self):
+        # Missing for 2 minutes, blind for 2 minutes, then missing again. The
+        # outage must not make the five-minute discovery window look satisfied.
+        statuses = [
+            {"state": "missing"},
+            watch.GhCommandError("boom"),
+            {"state": "missing"},
+            {"state": "missing"},
+            {"state": "missing"},
+            {"state": "missing"},
+        ]
+
+        out, _collector, getter = self.run_clocked(
+            statuses, poll_seconds=120, max_session_minutes=15
+        )
+
+        self.assertEqual(out, "no_pipeline\n")
+        self.assertEqual(getter.call_count, 6)
+
+    def test_the_discovery_window_starts_once_the_merge_sha_is_known(self):
+        # The merge SHA appears after 4.5 minutes; the 5-minute window starts then.
+        empty = dict(self.target(), merge_sha="")
+        targets = [empty] * 9 + [self.target()]
+
+        out, _collector, getter = self.run_clocked([{"state": "missing"}] * 20, targets=targets)
+
+        self.assertEqual(out, "no_pipeline\n")
+        self.assertEqual(getter.call_count, 11)
+
+    def test_an_empty_merge_sha_is_re_resolved(self):
+        empty = dict(self.target(), merge_sha="")
+        statuses = [{"state": "failed", "job": "build"}]
+
+        out, collector, getter = self.run_clocked(statuses, targets=[empty, empty, self.target()])
+
+        self.assertEqual(out, "failed: build\n")
+        self.assertEqual(collector.call_count, 3)
+        getter.assert_called_once_with(self.target())
+
+    def test_a_transient_error_on_the_first_lookup_is_retried(self):
+        for message in (
+            "HTTP 503: Service Unavailable",
+            "GitHub CLI command timed out: gh pr view 7",
+            "read tcp: connection reset by peer",
+            "API rate limit exceeded",
+        ):
+            targets = [watch.GhCommandError(message), self.target()]
+
+            out, collector, _getter = self.run_clocked([{"state": "failed", "job": "build"}], targets=targets)
+
+            self.assertEqual(out, "failed: build\n", message)
+            self.assertEqual(collector.call_count, 2, message)
+
+    def test_a_permanent_error_on_the_first_lookup_fails_at_once(self):
+        errors = [
+            watch.GhCommandError("GraphQL: Could not resolve to a PullRequest with the number of 999."),
+            watch.GhCommandError("glab: 404 Not Found (HTTP 404)"),
+            watch.GhCommandError("GraphQL: Could not resolve to a Repository with the name 'owner/typo'."),
+            watch.GhCommandError("HTTP 401: Bad credentials"),
+            watch.GhCommandError("`gh` command not found"),
+            # Words from the command line, such as a repo name, are not a network error.
+            watch.GhCommandError(
+                "GitHub CLI command failed: gh pr view 99999 -R acme/request-timeout-lib --json number\n"
+                "stderr: GraphQL: Could not resolve to a PullRequest with the number of 99999."
+            ),
+            watch.GhCommandError(
+                "GitHub CLI command failed: gh pr view 1 -R acme/timeout-rate-limit\n"
+                "stderr: GraphQL: Could not resolve to a Repository with the name 'acme/timeout-rate-limit'."
+            ),
+            ValueError("the PR/MR is not merged"),
+        ]
+        for error in errors:
+            with patch.object(watch, "collect_merge_pipeline_target", side_effect=[error]) as collector, \
+                    patch.object(watch, "get_merge_pipeline_status") as getter, \
+                    patch.object(watch.time, "sleep") as sleep:
+                with self.assertRaises(type(error)):
+                    watch.run_watch_merge_pipeline(self.args())
+            self.assertEqual(collector.call_count, 1, error)
+            getter.assert_not_called()
+            sleep.assert_not_called()
+
+    def test_a_canceled_pipeline_is_held_and_a_late_run_resets_it(self):
+        statuses = [{"state": "canceled"}, {"state": "pending"}, {"state": "canceled"}] + [{"state": "canceled"}] * 2
+
+        out, _collector, getter = self.run_clocked(statuses)
+
+        self.assertEqual(out, "canceled\n")
+        self.assertEqual(getter.call_count, 5)
+
+    def test_a_new_completed_run_restarts_the_settle_grace(self):
+        # The state stays "success" but a downstream run appears already done.
+        # The hold must restart, or a later deployment run is missed.
+        first = self.merge_run(1)
+        second = self.merge_run(2)
+        statuses = [
+            watch.summarize_merge_pipeline_runs([first]),
+            watch.summarize_merge_pipeline_runs([first, second]),
+            watch.summarize_merge_pipeline_runs([first, second]),
+            watch.summarize_merge_pipeline_runs([first, second]),
+        ]
+
+        out, _collector, getter = self.run_clocked(statuses)
+
+        self.assertEqual(out, "success\n")
+        self.assertEqual(getter.call_count, 4)
+
+    def test_a_rerun_attempt_restarts_the_settle_grace(self):
+        first = self.merge_run(1, run_attempt=1)
+        retried = self.merge_run(1, run_attempt=2)
+        statuses = [
+            watch.summarize_merge_pipeline_runs([first]),
+            watch.summarize_merge_pipeline_runs([retried]),
+            watch.summarize_merge_pipeline_runs([retried]),
+            watch.summarize_merge_pipeline_runs([retried]),
+        ]
+
+        out, _collector, getter = self.run_clocked(statuses)
+
+        self.assertEqual(out, "success\n")
+        self.assertEqual(getter.call_count, 4)
+
+    def test_no_hold_when_the_settle_time_is_zero(self):
+        with patch.object(watch, "MERGE_PIPELINE_SETTLE_SECONDS", 0):
+            out, _collector, getter = self.run_clocked([{"state": "success"}])
+
+        self.assertEqual(out, "success\n")
+        getter.assert_called_once()
+
+    def test_a_pending_pipeline_times_out(self):
+        now = [0.0]
+        stdout = io.StringIO()
+
+        def fake_sleep(seconds):
+            now[0] += seconds
+
+        with patch.object(watch, "collect_merge_pipeline_target", return_value=self.target()), \
+                patch.object(watch, "get_merge_pipeline_status", return_value={"state": "pending"}), \
+                patch.object(watch.time, "time", side_effect=lambda: now[0]), \
+                patch.object(watch.time, "sleep", side_effect=fake_sleep), \
+                patch.object(sys, "stdout", stdout):
+            code = watch.run_watch_merge_pipeline(self.args(max_session_minutes=1))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), "timeout\n")
+
+
+class WatchMergePipelineCliTests(unittest.TestCase):
+    def test_the_flag_selects_the_merge_pipeline_mode(self):
+        with patch.object(sys, "argv", ["gh_pr_watch.py", "--watch-merge-pipeline"]):
+            args = watch.parse_args()
+
+        self.assertTrue(args.watch_merge_pipeline)
+        self.assertFalse(args.once)
+        self.assertFalse(args.watch)
+        self.assertFalse(args.snapshot)
+        self.assertFalse(args.retry_failed_now)
+
+    def test_the_flag_cannot_be_combined_with_another_mode(self):
+        for other in ("--once", "--snapshot", "--watch", "--retry-failed-now"):
+            with self.subTest(other=other):
+                with patch.object(sys, "argv", ["gh_pr_watch.py", "--watch-merge-pipeline", other]):
+                    with self.assertRaises(SystemExit):
+                        watch.parse_args()
+
+    def test_main_dispatches_the_merge_pipeline_mode(self):
+        with patch.object(sys, "argv", ["gh_pr_watch.py", "--watch-merge-pipeline"]), \
+                patch.object(watch, "activate_config", return_value=None), \
+                patch.object(watch, "run_watch_merge_pipeline", return_value=0) as runner:
+            code = watch.main()
+
+        self.assertEqual(code, 0)
+        runner.assert_called_once()
 
 
 if __name__ == "__main__":

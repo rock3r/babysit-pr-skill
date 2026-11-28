@@ -8,11 +8,11 @@ timeout, and the watcher decodes all output as UTF-8.
 ### PR metadata
 
 ```bash
-gh pr view --json number,url,state,mergedAt,closedAt,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,mergeable,mergeStateStatus,reviewDecision,labels
+gh pr view --json number,url,state,mergedAt,closedAt,mergeCommit,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,mergeable,mergeStateStatus,reviewDecision,labels
 ```
 
 The watcher uses this to find the PR number, URL, branch, head SHA, labels, and the closed, merged, and mergeable
-state.
+state. `mergeCommit.oid` is the commit the base branch was updated to when the PR merged.
 
 ### PR checks
 
@@ -37,6 +37,40 @@ gh api repos/{owner}/{repo}/actions/runs -X GET -f head_sha=<sha> -f per_page=10
 
 The watcher uses this to find failed workflow runs and the run IDs to rerun. It keeps only the latest run of each
 workflow.
+
+### Post-merge pipeline
+
+```bash
+# All workflow runs for the merge commit (the watcher keeps only base-branch runs from merge events)
+gh api repos/{owner}/{repo}/actions/runs -X GET -f head_sha=<merge-sha> -f per_page=100 -f page=<p>
+
+# Jobs of a failed run, to name the failed job
+gh api repos/{owner}/{repo}/actions/runs/<run-id>/jobs -X GET -f per_page=100 -f page=<p> -f filter=latest
+```
+
+`--watch-merge-pipeline` waits for these runs and prints one line. Only runs on the base branch from events the merge
+starts count: `push`, `workflow_run`, `workflow_dispatch`, `dynamic`, `check_suite`, `deployment`, and
+`deployment_status`. Runs from `issue_comment`, `issues`, `schedule` and similar events also land on the merge commit
+right after a merge, but say nothing about it. A run concluded `action_required` reports `manual: <workflow>`, and so
+does a `waiting` run unless every pending deployment has no reviewers and a wait timer that is still running (from
+`wait_timer_started_at`, plus a 2-minute grace for GitHub to start the deployment). Such a timer-only wait starts on
+its own and stays pending; required reviewers, a custom protection rule (no reviewers, no timer), a timer with no start
+time, or an elapsed timer need someone. A lookup that fails for good (a 403, say) is `manual` too; a transient one is
+retried:
+
+```bash
+# Pending deployments of a waiting run (reviewers vs. a timer-only wait)
+gh api repos/{owner}/{repo}/actions/runs/<run-id>/pending_deployments -X GET
+```
+
+A failed run reports its first failed job, or the workflow name when the jobs lookup fails. Every result except `failed`
+is held for 60 seconds to catch a late `workflow_run`, and the hold
+restarts whenever an observed run appears, retries, or changes result; no run within 5 minutes of the merge commit being known reports `no_pipeline`.
+Independent runs of one workflow all count, so a failed or canceled run is not hidden by a newer successful
+invocation; a rerun replaces its earlier attempt. A `neutral` conclusion is not a pass: it usually means a check has
+something to report (Cursor Bugbot returns it when it has comments), so it prints `failed: <job>`. Any other completed
+conclusion outside `success` and `skipped` is not green either. A poll error clears the hold, and a
+job name is flattened to one line before printing. An empty `mergeCommit.oid` is re-read on each poll until it appears.
 
 ### Failed log inspection
 
@@ -143,8 +177,9 @@ gh api graphql -F threadId="<PRRT_...>" -f query='
 | `url` | Finding `owner/repo` |
 | `state` | Detecting closed PRs |
 | `mergedAt` / `closedAt` | Detecting the end state |
+| `mergeCommit.oid` | The base-branch commit to watch after a merge (merge, squash, or rebase) |
 | `headRefName` | Branch name |
-| `baseRefName` | Base branch, for the up-to-date requirement |
+| `baseRefName` | Base branch, for the up-to-date requirement and the post-merge pipeline |
 | `headRefOid` | Head SHA for the workflow run lookup |
 | `mergeable` | Detecting conflicts (`CONFLICTING`) |
 | `mergeStateStatus` | Detecting `BEHIND`, `BLOCKED`, `DIRTY`, `DRAFT`, and `UNKNOWN` |

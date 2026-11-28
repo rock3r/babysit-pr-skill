@@ -31,6 +31,33 @@ values.
 | `cleanup.branch_delete_requires_approval` | `false` | Require explicit owner approval before deleting a merged local branch. |
 | `sync.keep` | `[]` | Consumer-owned relative paths/globs inside `.agents/skills/babysit-pr/` (`*` also matches `/`) preserved across `sync.py` upgrades (`skill-source.json`, `config.json`, and `VERSION` are always reserved). |
 
+## Post-merge pipeline
+
+After a merged `stop_pr_closed`, the watch subagent runs `--watch-merge-pipeline` for the same PR/MR. The watcher
+resolves the commit the base branch was updated to (GitHub `mergeCommit.oid`; GitLab `merge_commit_sha`, then, on
+fast-forward projects only, `squash_commit_sha` for a squashed MR or the MR `sha` otherwise), re-reading the PR/MR while
+that SHA is still empty, waits for the base-branch pipeline on that commit, and prints one line:
+
+| Line | Meaning | Action |
+|---|---|---|
+| `success` | Every base-branch run/pipeline passed (skipped runs may be mixed in). | Clean up and report. |
+| `failed: <job>` | A run/job failed, or a concluded check was not green (GitHub `neutral`, for example a bot with findings). | Report the job and the merge commit to the owner. Do not push to the base branch or rerun jobs unless the owner asks. |
+| `canceled` | The pipeline was canceled. | Report to the owner. |
+| `manual: <job>` | A manual job, a deployment gate that needs someone (required reviewers, a custom protection rule, or an elapsed wait timer), or an `action_required` run blocks the pipeline. A deployment held only by a running wait timer keeps waiting. | Tell the owner which job needs a person. |
+| `skipped` | Every pipeline was skipped by its rules. | Report it; it is not a failure. |
+| `no_pipeline` | No base-branch run appeared within 5 minutes. | Report it. Valid for a repo without base-branch pipelines; otherwise check the CI triggers. |
+| `timeout` | The pipeline was still pending at `--max-session-minutes` (a result already in its hold is printed instead). | Report it; do not keep polling by hand. |
+
+Any unfinished run keeps the result pending, so a deployment held only by a running wait timer outranks an earlier
+failed, canceled, or manual run until it finishes. When a commit has several runs or pipelines, the worst result wins,
+so an older failure is never hidden by a newer success.
+
+A closed unmerged PR skips this step. Cleanup can proceed after a merge; a post-merge failure is reported, not fixed
+automatically. Both hosts keep every result except `failed` stable for 60 seconds before printing it, restarting the
+hold whenever an observed run or pipeline appears, retries, or changes result, so a late `workflow_run` chain or a
+second pipeline on the same commit is not missed. A poll error clears the hold and restarts the 5-minute discovery
+window, so a stale success or an early `no_pipeline` is never printed after an unverified window.
+
 ## Diagnostic playbooks for uncommon actions
 
 - **`diagnose_merge_blocked`**: All reported checks passed and no open review thread or conflict explains GitHub's

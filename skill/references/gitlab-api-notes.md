@@ -84,6 +84,47 @@ glab api --hostname <host> -X POST projects/<pipeline project id>/jobs/<job id>/
 
 Diagnose a failure with `glab ci view` or `glab ci trace <job id> -R <group>/<project>`.
 
+### Post-merge pipeline
+
+After a merged MR, `--watch-merge-pipeline` resolves the commit that the target branch was updated to, in this order:
+`merge_commit_sha`, then — only when the project's `merge_method` is `ff` (`GET projects/<id>`) — `squash_commit_sha`
+for a squashed MR or the MR `sha` otherwise. With `merge` or `rebase_merge` the target gets its own commit and
+`squash_commit_sha` names a source-branch commit, so the watcher waits for `merge_commit_sha` rather than watch the
+wrong commit. Otherwise it re-reads the MR until a merge SHA appears. It
+tracks every matching pipeline for that commit on the target branch:
+
+```bash
+glab api --hostname <host> 'projects/<target project id>/pipelines?sha=<sha>&ref=<target branch>'
+glab api --hostname <host> 'projects/<target project id>/pipelines?sha=<sha>&ref=<target branch>&source=parent_pipeline'
+glab api --hostname <host> 'projects/<target project id>/pipelines/<id>/jobs?per_page=100&page=<n>'
+glab api --hostname <host> 'projects/<target project id>/pipelines/<id>/bridges?per_page=100&page=<n>'
+```
+
+If an instance ignores `ref` when `sha` is present, the watcher retries with the SHA only and keeps only pipelines whose
+`ref` equals the target branch. The list leaves child pipelines out unless `source=parent_pipeline` asks for them, so
+the watcher makes that second query too, in the same form (with or without `ref`) that found the parents, and only when
+a parent exists: a child triggered without `strategy: depend` can still run or fail after its parent succeeds. When
+children exist, it reads each pipeline's bridges and drops a child whose trigger job, or an ancestor's, has
+`allow_failure: true`, as GitLab keeps the parent green for it. Multi-project downstream pipelines are not followed. Every matching pipeline counts: the printed state is the worst one, so an older failure
+is never hidden by a newer success. The 60-second hold covers every pipeline, so a second pipeline that starts later
+restarts it.
+
+The state uses the same precedence as GitHub: any still-running pipeline keeps the result pending, then a failure, a
+cancellation, or a manual block wins over success.
+
+| Aggregate status | Printed line | Notes |
+|---|---|---|
+| any pipeline `created`, `waiting_for_resource`, `preparing`, `pending`, `running`, `scheduled` | none yet | Keep waiting, even when another pipeline already failed. |
+| any pipeline `failed` | `failed: <job>` | Newest failed pipeline's first failed blocking job or bridge (`allow_failure: false`); the pipeline name when the lookup fails. |
+| any pipeline `canceled` | `canceled` | |
+| any pipeline `manual` or `blocked` | `manual: <job>` | Newest such pipeline's first blocking manual job (`allow_failure: false`); optional manual jobs do not name the blocker. |
+| every pipeline `skipped` | `skipped` | Not a failure. |
+| every pipeline `success` or `skipped` | `success` | Held for 60 s like GitHub; a late second pipeline restarts the hold. |
+| no pipeline | `no_pipeline` | After a 5-minute discovery grace. |
+
+If the pipeline is still not terminal at `--max-session-minutes`, it prints `timeout`. The post-merge mode is
+read-only: it never retries a job or pushes to the target branch. A post-merge failure is reported to the owner.
+
 ### Discussions
 
 ```bash

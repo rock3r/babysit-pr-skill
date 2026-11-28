@@ -585,6 +585,400 @@ class ReviewItemTests(GlabTestCase):
             self.assertEqual((item["path"], item["line"], item["side"]), ("src/old.py", 12, "old"))
 
 
+class MergePipelineTests(unittest.TestCase):
+    def target(self, **overrides):
+        pr = {"host": HOST, "project_id": 11, "repo": PATH}
+        pr.update(overrides)
+        return {"pr": pr, "repo": PATH, "base_branch": "main", "merge_sha": SHA}
+
+    def test_the_merge_commit_is_the_preferred_sha(self):
+        pr = {
+            "merged": True,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "m" * 40,
+            "squash_commit_sha": "s" * 40,
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})):
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+        self.assertEqual(target["merge_sha"], "m" * 40)
+
+    def test_the_squash_commit_is_the_next_choice_on_a_fast_forward_project(self):
+        pr = {
+            "merged": True,
+            "host": HOST,
+            "project_id": 11,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "s" * 40,
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                patch.object(glab, "glab_api", return_value={"merge_method": "ff"}) as api:
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+        self.assertEqual(target["merge_sha"], "s" * 40)
+        api.assert_called_once_with(HOST, "projects/11")
+
+    def test_a_squash_commit_outside_a_fast_forward_project_is_not_the_target(self):
+        # With merge or rebase_merge the target gets its own commit and
+        # `squash_commit_sha` is a source-branch commit. Watching it would miss
+        # the real target pipeline, so wait for `merge_commit_sha` instead.
+        pr = {
+            "merged": True,
+            "host": HOST,
+            "project_id": 11,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "s" * 40,
+            "squash": True,
+        }
+
+        for merge_method in ("merge", "rebase_merge"):
+            with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                    patch.object(glab, "glab_api", return_value={"merge_method": merge_method}):
+                target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+            self.assertEqual(target["merge_sha"], "", merge_method)
+
+    def test_an_unreadable_merge_method_waits_for_the_merge_sha(self):
+        pr = {
+            "merged": True,
+            "host": HOST,
+            "project_id": 11,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "s" * 40,
+            "squash": True,
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                patch.object(glab, "glab_api", return_value={}):
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+        self.assertEqual(target["merge_sha"], "")
+
+    def _head_only_target(self, merge_method, squash=False):
+        pr = {
+            "merged": True,
+            "host": HOST,
+            "project_id": 11,
+            "repo": PATH,
+            "base_branch": "main",
+            "head_sha": "h" * 40,
+            "merge_commit_sha": "",
+            "squash_commit_sha": "",
+            "squash": squash,
+        }
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})), \
+                patch.object(glab, "glab_api", return_value={"merge_method": merge_method}) as api:
+            target = glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+        api.assert_called_once_with(HOST, "projects/11")
+        return target
+
+    def test_the_head_sha_is_the_last_choice_on_a_fast_forward_project(self):
+        self.assertEqual(self._head_only_target("ff")["merge_sha"], "h" * 40)
+
+    def test_a_squashed_fast_forward_merge_waits_instead_of_watching_the_head(self):
+        self.assertEqual(self._head_only_target("ff", squash=True)["merge_sha"], "")
+
+    def test_a_merge_commit_project_waits_for_the_merge_sha(self):
+        self.assertEqual(self._head_only_target("merge")["merge_sha"], "")
+
+    def test_an_unmerged_mr_is_rejected(self):
+        pr = {"merged": False, "repo": PATH, "base_branch": "main", "head_sha": SHA}
+
+        with patch.object(glab, "resolve_mr", return_value=(pr, {})):
+            with self.assertRaisesRegex(ValueError, "not merged"):
+                glab.collect_merge_pipeline_target(SimpleNamespace(pr="7", repo=None))
+
+    def _status(self, pipelines, jobs=None, bridges=None, children=None, pipeline_bridges=None):
+        calls = []
+
+        def fake_list(host, endpoint):
+            calls.append(endpoint)
+            if "/pipelines?" in endpoint and "source=parent_pipeline" in endpoint:
+                return children or []
+            if "/pipelines?" in endpoint:
+                return pipelines
+            if endpoint.endswith("/jobs"):
+                return jobs or []
+            if endpoint.endswith("/bridges"):
+                if pipeline_bridges is not None:
+                    return pipeline_bridges.get(int(endpoint.split("/")[-2]), [])
+                return bridges or []
+            raise AssertionError(endpoint)
+
+        with patch.object(glab, "glab_api_list", side_effect=fake_list):
+            status = glab.get_merge_pipeline_status(self.target())
+        return status, calls
+
+    def test_a_successful_pipeline_is_success(self):
+        status, calls = self._status([{"id": 5, "status": "success", "ref": "main"}])
+
+        self.assertEqual(status["state"], "success")
+        self.assertIn(f"sha={SHA}", calls[0])
+        self.assertIn("ref=main", calls[0])
+
+    def test_a_failed_child_pipeline_is_not_hidden_by_a_successful_parent(self):
+        # A child triggered without `strategy: depend` leaves its parent green.
+        status, calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            jobs=[job("deploy", "failed")],
+            children=[{"id": 6, "status": "failed", "ref": "main"}],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "deploy"))
+        self.assertTrue(any("source=parent_pipeline" in call and f"sha={SHA}" in call for call in calls))
+        self.assertIn("projects/11/pipelines/6/jobs", " ".join(calls))
+
+    def test_a_child_whose_trigger_allows_failure_does_not_count(self):
+        # GitLab keeps the parent green on purpose, and so must the watcher,
+        # for the child and for anything that child triggers in turn.
+        def bridge(downstream_id, allow_failure):
+            return {"name": "trigger", "status": "success", "allow_failure": allow_failure,
+                    "downstream_pipeline": {"id": downstream_id}}
+
+        status, _calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            children=[
+                {"id": 6, "status": "failed", "ref": "main"},
+                {"id": 7, "status": "running", "ref": "main"},
+                {"id": 8, "status": "success", "ref": "main"},
+            ],
+            pipeline_bridges={5: [bridge(6, True), bridge(8, False)], 6: [bridge(7, False)]},
+        )
+
+        self.assertEqual(status["state"], "success")
+
+    def test_a_required_grandchild_failure_counts(self):
+        def bridge(downstream_id):
+            return {"name": "trigger", "allow_failure": False, "downstream_pipeline": {"id": downstream_id}}
+
+        status, _calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            children=[{"id": 6, "status": "success", "ref": "main"}, {"id": 7, "status": "failed", "ref": "main"}],
+            pipeline_bridges={5: [bridge(6)], 6: [bridge(7)]},
+        )
+
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["pipeline"]["id"], 7)
+
+    def test_without_children_no_bridge_lookup_is_made(self):
+        _status, calls = self._status([{"id": 5, "status": "success", "ref": "main"}])
+
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(any(call.endswith("/bridges") for call in calls))
+
+    def test_no_child_query_without_a_parent(self):
+        _status, calls = self._status([])
+
+        self.assertFalse(any("source=parent_pipeline" in call for call in calls))
+
+    def test_a_running_child_pipeline_keeps_the_result_pending(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "success", "ref": "main"}],
+            children=[{"id": 6, "status": "running", "ref": "main"}],
+        )
+
+        self.assertEqual(status["state"], "pending")
+        self.assertEqual(status["pipeline"]["id"], 6)
+
+    def test_a_running_pipeline_is_pending(self):
+        status, _calls = self._status([{"id": 5, "status": "running", "ref": "main"}])
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_a_failed_pipeline_reports_the_failed_job(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "failed", "ref": "main"}],
+            jobs=[job("build", "failed")],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "build"))
+
+    def test_a_failed_optional_job_is_not_named_as_the_cause(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "failed", "ref": "main"}],
+            jobs=[job("lint", "failed", allow_failure=True, job_id=10), job("deploy", "failed", job_id=12)],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "deploy"))
+
+    def test_a_failed_pipeline_falls_back_to_the_pipeline_name(self):
+        status, _calls = self._status([{"id": 5, "status": "failed", "ref": "main"}])
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "pipeline"))
+
+    def test_a_failed_job_lookup_error_falls_back_to_the_pipeline_name(self):
+        def fake_list(host, endpoint):
+            if "/pipelines?" in endpoint:
+                return [{"id": 5, "status": "failed", "ref": "main"}]
+            raise glab.core.GhCommandError("boom")
+
+        with patch.object(glab, "glab_api_list", side_effect=fake_list):
+            status = glab.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "pipeline"))
+
+    def test_a_canceled_pipeline_is_reported(self):
+        status, _calls = self._status([{"id": 5, "status": "canceled", "ref": "main"}])
+
+        self.assertEqual(status["state"], "canceled")
+
+    def test_a_skipped_pipeline_is_reported(self):
+        status, _calls = self._status([{"id": 5, "status": "skipped", "ref": "main"}])
+
+        self.assertEqual(status["state"], "skipped")
+
+    def test_a_manual_pipeline_reports_the_blocking_job(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "manual", "ref": "main"}],
+            jobs=[job("deploy", "manual", allow_failure=False)],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "deploy"))
+
+    def test_an_optional_manual_job_does_not_name_the_blocker(self):
+        status, _calls = self._status(
+            [{"id": 5, "status": "manual", "ref": "main"}],
+            jobs=[job("optional-deploy", "manual", allow_failure=True)],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "pipeline"))
+
+    def test_a_second_successful_pipeline_changes_the_signature(self):
+        first = {"id": 5, "status": "success", "ref": "main"}
+        later = {"id": 6, "status": "success", "ref": "main"}
+
+        with patch.object(glab, "glab_api_list", return_value=[first]):
+            before = glab.get_merge_pipeline_status(self.target())
+        with patch.object(glab, "glab_api_list", return_value=[first, later]):
+            after = glab.get_merge_pipeline_status(self.target())
+
+        self.assertEqual((before["state"], after["state"]), ("success", "success"))
+        self.assertNotEqual(
+            core.merge_pipeline_settle_key(before),
+            core.merge_pipeline_settle_key(after),
+        )
+
+    def test_a_newer_success_does_not_hide_an_older_failure(self):
+        # A commit can carry more than one pipeline. Every pipeline counts, so
+        # the worst result is reported instead of the highest pipeline id.
+        status, calls = self._status(
+            [
+                {"id": 5, "status": "failed", "ref": "main"},
+                {"id": 6, "status": "success", "ref": "main"},
+            ],
+            jobs=[job("build", "failed")],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("failed", "build"))
+        self.assertTrue(any("/pipelines/5/jobs" in call for call in calls))
+
+    def test_a_newer_success_does_not_hide_an_older_canceled_pipeline(self):
+        status, _calls = self._status([
+            {"id": 5, "status": "canceled", "ref": "main"},
+            {"id": 6, "status": "success", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "canceled")
+
+    def test_a_newer_success_does_not_hide_an_older_manual_pipeline(self):
+        status, _calls = self._status(
+            [
+                {"id": 5, "status": "manual", "ref": "main"},
+                {"id": 6, "status": "success", "ref": "main"},
+            ],
+            jobs=[job("deploy", "manual")],
+        )
+
+        self.assertEqual((status["state"], status["job"]), ("manual", "deploy"))
+
+    def test_a_running_pipeline_keeps_the_result_pending_even_with_a_failure(self):
+        # Same precedence as GitHub: an unfinished pipeline keeps the result
+        # open, because its result can still change the worst outcome.
+        status, _calls = self._status([
+            {"id": 5, "status": "failed", "ref": "main"},
+            {"id": 6, "status": "running", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "pending")
+
+    def test_success_and_skipped_pipelines_are_success(self):
+        status, _calls = self._status([
+            {"id": 5, "status": "success", "ref": "main"},
+            {"id": 6, "status": "skipped", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "success")
+
+    def test_all_skipped_pipelines_are_skipped(self):
+        status, _calls = self._status([
+            {"id": 5, "status": "skipped", "ref": "main"},
+            {"id": 6, "status": "skipped", "ref": "main"},
+        ])
+
+        self.assertEqual(status["state"], "skipped")
+
+    def test_a_missing_pipeline_falls_back_to_a_sha_only_lookup(self):
+        calls = []
+
+        def fake_list(host, endpoint):
+            calls.append(endpoint)
+            if "ref=main" in endpoint:
+                return []
+            if "source=parent_pipeline" in endpoint:
+                return []
+            if "/pipelines?" in endpoint:
+                return [{"id": 5, "status": "success", "ref": "main"}]
+            raise AssertionError(endpoint)
+
+        with patch.object(glab, "glab_api_list", side_effect=fake_list):
+            status = glab.get_merge_pipeline_status(self.target())
+
+        self.assertEqual(status["state"], "success")
+        # Ref-filtered then SHA-only for parents; children reuse the form that worked.
+        self.assertEqual(len(calls), 3)
+        self.assertIn("source=parent_pipeline", calls[2])
+        self.assertNotIn("ref=", calls[2])
+
+    def test_a_sha_only_lookup_ignores_other_refs(self):
+        status, _calls = self._status([{"id": 5, "status": "success", "ref": "feature"}])
+
+        self.assertEqual(status["state"], "missing")
+
+    def test_normalize_mr_carries_the_merge_sha_fields(self):
+        payload = mr_payload(state="merged")
+        payload["merge_commit_sha"] = "m" * 40
+        payload["squash_commit_sha"] = "s" * 40
+        payload["squash"] = True
+
+        pr = glab.normalize_mr(payload, HOST)
+
+        self.assertEqual(pr["merge_commit_sha"], "m" * 40)
+        self.assertEqual(pr["squash_commit_sha"], "s" * 40)
+        self.assertTrue(pr["squash"])
+
+    def test_normalize_mr_reads_squash_on_merge_too(self):
+        payload = mr_payload(state="merged")
+        payload["squash_on_merge"] = True
+
+        pr = glab.normalize_mr(payload, HOST)
+
+        self.assertTrue(pr["squash"])
+
+
 class ConfigTests(unittest.TestCase):
     def test_codex_and_pr_af_are_forced_off(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -603,12 +997,18 @@ class ConfigTests(unittest.TestCase):
         with patch.object(core, "collect_snapshot", core.collect_snapshot), \
                 patch.object(core, "rerun_failed_run", core.rerun_failed_run), \
                 patch.object(core, "activate_config", core.activate_config), \
+                patch.object(core, "collect_merge_pipeline_target", None), \
+                patch.object(core, "get_merge_pipeline_status", None), \
+                patch.object(core, "MERGE_PIPELINE_SETTLE_SECONDS", 45), \
                 patch.object(core, "main", return_value=42) as mock_main:
             exit_code = glab.main()
             self.assertEqual(exit_code, 42)
             self.assertIs(core.collect_snapshot, glab.collect_snapshot)
             self.assertIs(core.rerun_failed_run, glab.retry_job)
             self.assertIs(core.activate_config, glab.activate_config)
+            self.assertIs(core.collect_merge_pipeline_target, glab.collect_merge_pipeline_target)
+            self.assertIs(core.get_merge_pipeline_status, glab.get_merge_pipeline_status)
+            self.assertEqual(core.MERGE_PIPELINE_SETTLE_SECONDS, 45)
             mock_main.assert_called_once_with()
 
 
